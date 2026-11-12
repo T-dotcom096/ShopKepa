@@ -59,6 +59,9 @@ class MultiPageApp {
   private buyerStatusFilter: 'all' | 'completed' | 'pending' = 'all';
   private buyerSearchQuery: string = '';
 
+  // Auth mode state (login vs signup)
+  private authTab: 'login' | 'signup' = 'login';
+
   // State for product page image upload
   private uploadedProductImageBase64: string = '';
   private rawUploadedImageBase64: string = '';
@@ -68,21 +71,22 @@ class MultiPageApp {
   }
 
   private init(): void {
-    // Populate community merchants directory for the explore marketplace
-    StorageService.ensureCommunityDirectory();
+    // Purge any demo showcase stores so real buyers see authentic merchants only
+    StorageService.purgeDemoStores();
 
     this.currentUser = StorageService.getCurrentUser();
-    if (!this.currentUser) {
-      // Default initial user starts as a fresh merchant
-      this.currentUser = StorageService.createDefaultEmptyMerchant();
-    }
+    this.authTab = StorageService.getAllUsers().length > 0 ? 'login' : 'signup';
 
     // Client-side Hash Router
     window.addEventListener('hashchange', () => this.handleRouting());
 
     if (!window.location.hash) {
-      // If buyer, default to explore; if merchant, default to sales
-      window.location.hash = this.currentUser.role === 'buyer' ? '#/explore' : '#/sales';
+      if (!this.currentUser) {
+        window.location.hash = '#/auth';
+      } else {
+        window.location.hash = this.currentUser.role === 'buyer' ? '#/explore' : '#/sales';
+      }
+      this.handleRouting();
     } else {
       this.handleRouting();
     }
@@ -124,12 +128,111 @@ class MultiPageApp {
     }
   }
 
+  // --- Guest Browsing Shell (Marketplace & WhatsApp Catalog Browsing) ---
+  private renderGuestShell(appEl: HTMLElement): void {
+    const isStorefront = this.currentRoute.startsWith('#/storefront');
+    appEl.innerHTML = `
+      <div class="app-container">
+        <!-- Persistent Top Header for Guest Browsing -->
+        <header class="app-header">
+          <a href="#/explore" class="brand-section">
+            <div class="brand-logo-mark">₦</div>
+            <div class="brand-info">
+              <span class="brand-title">ShopKepa</span>
+              <span class="brand-store-name">Marketplace & Verified Merchants</span>
+            </div>
+          </a>
+
+          <div class="header-actions">
+            <span class="role-indicator-badge" style="background:rgba(59,130,246,0.12); color:#60a5fa; border:1px solid rgba(59,130,246,0.3);">
+              🌐 Guest Browsing
+            </span>
+            <a href="#/auth" class="btn btn-primary btn-sm">
+              🔑 Log In / Register
+            </a>
+          </div>
+        </header>
+
+        <!-- Vertical & Collapsible Navigation Section for Guest -->
+        <nav class="nav-section-container" aria-label="Page Navigation">
+          <div class="nav-section-header">
+            <div class="nav-header-left">
+              <span class="nav-header-title">Marketplace Navigation</span>
+              <span class="badge badge-paid">
+                ${isStorefront ? '🛍️ Merchant Storefront' : '🌐 Browse Stores'}
+              </span>
+            </div>
+            <button
+              type="button"
+              id="btn-toggle-nav-collapse"
+              class="btn-toggle-collapse"
+              aria-expanded="${!this.isNavCollapsed}"
+              title="${this.isNavCollapsed ? 'Open navigation menu' : 'Collapse navigation menu'}"
+            >
+              <span>${this.isNavCollapsed ? '☰ Show Pages' : 'Collapse'}</span>
+              <span class="collapse-icon">${this.isNavCollapsed ? '▼' : '▲'}</span>
+            </button>
+          </div>
+
+          <div id="nav-collapsible-wrapper" class="nav-collapsible-wrapper ${this.isNavCollapsed ? 'collapsed' : ''}">
+            <div class="nav-pages-vertical">
+              <a href="#/explore" class="nav-page-link-vertical ${!isStorefront ? 'active' : ''}">
+                <span class="nav-link-left">
+                  <span class="nav-link-icon">🌐</span>
+                  <span class="nav-link-label">Browse Stores & Marketplace</span>
+                </span>
+              </a>
+              <a href="#/auth" class="nav-page-link-vertical">
+                <span class="nav-link-left">
+                  <span class="nav-link-icon">🏪</span>
+                  <span class="nav-link-label">Merchant Login / Create Store</span>
+                </span>
+                <span class="nav-link-right">
+                  <span class="badge badge-paid">Start Free</span>
+                </span>
+              </a>
+            </div>
+          </div>
+        </nav>
+
+        <!-- Dynamic Multi-Page Router View -->
+        <main id="page-viewport" style="display:flex; flex-direction:column; gap:20px;">
+          ${this.renderCurrentPageView([], [], { totalRevenue: 0, totalOrders: 0, aov: 0, totalDebt: 0 })}
+        </main>
+
+        <!-- Mobile Bottom Navigation for Guests -->
+        <nav class="mobile-bottom-nav" aria-label="Quick Mobile Navigation">
+          <a href="#/explore" class="mobile-nav-item ${!isStorefront ? 'active' : ''}">
+            <span class="mobile-nav-icon">🌐</span>
+            <span>Stores</span>
+          </a>
+          <a href="#/auth" class="mobile-nav-item">
+            <span class="mobile-nav-icon">🔑</span>
+            <span>Sign In</span>
+          </a>
+        </nav>
+      </div>
+    `;
+
+    this.bindCurrentPageEvents([], []);
+  }
+
   // --- Main Shell Renderer ---
   public render(): void {
     const appEl = document.getElementById('app');
     if (!appEl) return;
 
-    if (!this.currentUser || this.currentRoute === '#/auth') {
+    const isPublicRoute = this.currentRoute === '#/explore' || this.currentRoute.startsWith('#/storefront');
+    if (!this.currentUser) {
+      if (isPublicRoute && this.currentRoute !== '#/auth') {
+        this.renderGuestShell(appEl);
+        return;
+      }
+      this.renderAuthPage(appEl);
+      return;
+    }
+
+    if (this.currentRoute === '#/auth') {
       this.renderAuthPage(appEl);
       return;
     }
@@ -204,6 +307,9 @@ class MultiPageApp {
             <a href="#/auth" class="btn btn-secondary btn-sm" title="Switch or Create Account">
               Switch
             </a>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-header-logout" title="Log out of this store">
+              Log Out
+            </button>
           </div>
         </header>
 
@@ -410,7 +516,7 @@ class MultiPageApp {
             type="text"
             id="explore-search-input"
             class="search-input"
-            placeholder="Search stores by name, niche, location (e.g. Lagos, Tech, Zainab)..."
+            placeholder="Search stores by name, niche, location (e.g. Lagos, Fashion, Gadgets)..."
             value="${this.exploreSearchQuery}"
           />
         </div>
@@ -479,13 +585,30 @@ class MultiPageApp {
       <!-- Merchants Directory Grid -->
       <div class="merchant-grid">
         ${
-          filtered.length === 0
+          allMerchants.length === 0
+            ? `<div class="empty-state" style="grid-column:1 / -1; padding:48px 24px; border:1px dashed var(--border-subtle); border-radius:var(--radius-lg);">
+                <span class="empty-state-icon">🏪</span>
+                <h3 style="font-size:var(--text-lg); margin-top:8px;">No Public Stores Published Yet</h3>
+                <p style="max-width:480px; margin:8px auto; color:var(--text-secondary); line-height:1.6;">
+                  All demo showcase stores have been cleared. As real verified merchants register and configure their store contact details, they will appear here for buyers to browse and place WhatsApp orders.
+                </p>
+                ${
+                  this.currentUser?.role === 'merchant'
+                    ? `<a href="#/settings" class="btn btn-primary btn-sm" style="margin-top:12px;">
+                         ⚙️ Set Up Your Store Profile to Publish Here
+                       </a>`
+                    : `<a href="#/auth" class="btn btn-primary btn-sm" style="margin-top:12px;">
+                         + Register Your Store on ShopKepa
+                       </a>`
+                }
+               </div>`
+            : filtered.length === 0
             ? `<div class="empty-state" style="grid-column:1 / -1;">
                 <span class="empty-state-icon">🔍</span>
                 <h3>No merchants found</h3>
-                <p>No merchants found matching your search in the "${this.exploreNicheFilter}" niche.</p>
+                <p>No verified stores found matching your search in the "${this.exploreNicheFilter}" niche.</p>
                 <button id="btn-reset-explore-filters" class="btn btn-secondary btn-sm" style="margin-top:8px;">
-                  Show All Merchants
+                  Show All Stores
                 </button>
                </div>`
             : filtered
@@ -620,7 +743,9 @@ class MultiPageApp {
               >
                 💬 Open WhatsApp Chat
               </a>`
-            : `<a href="#/settings" class="btn btn-secondary btn-sm">Set Phone in Settings</a>`
+            : !isViewingOther
+            ? `<a href="#/settings" class="btn btn-secondary btn-sm">Set Phone in Settings</a>`
+            : `<span class="badge badge-unpaid">No WhatsApp Phone</span>`
         }
       </section>
 
@@ -2624,6 +2749,21 @@ class MultiPageApp {
             </div>
           </div>
 
+          <!-- Account Session: Log Out & Switch -->
+          <div class="settings-card" style="margin-top:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+              <div>
+                <span class="form-label" style="margin:0;">Account Session & Security</span>
+                <p style="font-size:var(--text-xs); color:var(--text-secondary); margin-top:4px; line-height:1.4;">
+                  Logged in as <strong>${this.currentUser?.name}</strong> (${this.currentUser?.storeName || 'Store'}). Log out to switch to another store or return to the welcome screen.
+                </p>
+              </div>
+              <button type="button" id="btn-settings-logout" class="btn btn-secondary btn-sm">
+                🚪 Log Out of Store
+              </button>
+            </div>
+          </div>
+
           <!-- Danger Zone: Permanent Deletion & Data Clearing -->
           <div class="danger-zone-box" style="margin-top:12px;">
             <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
@@ -2951,7 +3091,7 @@ class MultiPageApp {
             <div class="modal-body">
               <div class="form-group">
                 <label class="form-label" for="buyer-merchant-name">Merchant / Business Name</label>
-                <input type="text" id="buyer-merchant-name" class="form-input" placeholder="e.g. Zainab Fabrics or Yaba Electronics" required />
+                <input type="text" id="buyer-merchant-name" class="form-input" placeholder="e.g. Island Fabrics or Yaba Electronics" required />
               </div>
 
               <div class="form-group">
@@ -4055,108 +4195,351 @@ class MultiPageApp {
   }
 
   // =========================================================================
-  // PAGE: AUTH & ONBOARDING (SIGN UP AS MERCHANT OR BUYER WITH NICHE)
+  // PAGE: AUTH & ONBOARDING (INTRODUCTORY MESSAGE + LOGIN & SIGN UP FORMS)
   // =========================================================================
   private renderAuthPage(container: HTMLElement): void {
+    const savedUsers = StorageService.getAllUsers().filter((u) => !u.isDeactivated);
+
     container.innerHTML = `
       <div class="auth-container">
-        <div class="auth-header">
-          <div style="display:flex; justify-content:center; margin-bottom:12px;">
-            <div class="brand-logo-mark">₦</div>
+        <!-- Return to active session if user clicked Switch -->
+        ${
+          this.currentUser
+            ? `
+          <div style="background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3); border-radius:12px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+            <div>
+              <span style="font-size:var(--text-xs); color:var(--text-secondary);">Active session:</span>
+              <strong style="color:var(--text-primary); font-size:var(--text-sm); display:block;">
+                ${this.currentUser.role === 'merchant' ? '🏪' : '🛒'} ${this.currentUser.storeName || this.currentUser.name}
+              </strong>
+            </div>
+            <a href="${this.currentUser.role === 'merchant' ? '#/sales' : '#/explore'}" class="btn btn-success btn-sm">
+              ← Return to Store
+            </a>
           </div>
-          <h1>Join ShopKepa</h1>
-          <p>Choose your role and niche to get started</p>
+        `
+            : ''
+        }
+
+        <!-- 1. Introductory Message & Value Proposition Hero -->
+        <div class="intro-hero">
+          <div class="intro-brand-row">
+            <div class="brand-logo-mark" style="width:48px; height:48px; font-size:24px;">₦</div>
+            <h1 class="intro-hero-title">ShopKepa</h1>
+          </div>
+          <div class="intro-hero-tagline">
+            Easy Store & Money Tracker for Everyday Retailers & Merchants
+          </div>
+          <p class="intro-hero-desc">
+            Welcome to ShopKepa! An offline-first business companion built to simplify your daily trade.
+            Track cash sales, monitor stock with automatic low-stock notifications, record customer debts,
+            and send 1-click WhatsApp payment reminders with your bank details.
+          </p>
+
+          <!-- 4 Core Feature Pillars -->
+          <div class="intro-features-grid">
+            <div class="intro-feature-card">
+              <span class="intro-feature-icon">📦</span>
+              <div class="intro-feature-text">
+                <strong>Live Inventory Tracking</strong>
+                <span>Real-time stock units on hand with alerts and 1-tap +5 restocks.</span>
+              </div>
+            </div>
+
+            <div class="intro-feature-card">
+              <span class="intro-feature-icon">💬</span>
+              <div class="intro-feature-text">
+                <strong>WhatsApp Debt Reminders</strong>
+                <span>Send pre-filled payment due notices with bank transfer receipts.</span>
+              </div>
+            </div>
+
+            <div class="intro-feature-card">
+              <span class="intro-feature-icon">📊</span>
+              <div class="intro-feature-text">
+                <strong>True Profit Visualizer</strong>
+                <span>Deducts store bills & overheads from sales to show real net profit.</span>
+              </div>
+            </div>
+
+            <div class="intro-feature-card">
+              <span class="intro-feature-icon">⚡</span>
+              <div class="intro-feature-text">
+                <strong>100% Offline-First</strong>
+                <span>Fast and secure. Your records remain private on your device.</span>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <form id="form-auth-setup" style="display:flex; flex-direction:column; gap:16px;">
-          <!-- Role Selector: Merchant vs Buyer -->
-          <div class="form-group">
-            <label class="form-label">I want to use ShopKepa as a:</label>
-            <div class="role-selector-row">
-              <div class="role-card-option active" data-role-select="merchant">
-                <div class="role-card-header">
-                  <span>🏪 Merchant</span>
-                  <span class="role-radio-check">✓</span>
-                </div>
-                <span class="role-card-desc">Sell goods, track stock & debts, publish WhatsApp storefront</span>
+        <!-- 2. Segmented Mode Switcher: Log In vs Sign Up -->
+        <div class="auth-tabs-wrapper">
+          <div class="auth-toggle-row" role="tablist">
+            <button
+              type="button"
+              class="auth-toggle-btn ${this.authTab === 'login' ? 'active' : ''}"
+              id="tab-auth-login"
+              role="tab"
+              aria-selected="${this.authTab === 'login'}"
+            >
+              🔑 Log In ${savedUsers.length > 0 ? `(${savedUsers.length})` : ''}
+            </button>
+            <button
+              type="button"
+              class="auth-toggle-btn ${this.authTab === 'signup' ? 'active' : ''}"
+              id="tab-auth-signup"
+              role="tab"
+              aria-selected="${this.authTab === 'signup'}"
+            >
+              ✨ Create New Account
+            </button>
+          </div>
+
+          <!-- TAB 1: LOGIN FORM -->
+          ${
+            this.authTab === 'login'
+              ? `
+            <div id="auth-panel-login" style="display:flex; flex-direction:column; gap:16px;">
+              <div style="text-align:center;">
+                <h2 style="font-size:var(--text-lg); font-weight:800; color:var(--text-primary); margin:0;">
+                  Welcome Back to Your Store
+                </h2>
+                <p style="font-size:var(--text-xs); color:var(--text-secondary); margin:4px 0 0 0;">
+                  Enter your registered phone number, store name, or email to access your shop.
+                </p>
               </div>
 
-              <div class="role-card-option" data-role-select="buyer">
-                <div class="role-card-header">
-                  <span>🛒 Buyer / Shopper</span>
-                  <span class="role-radio-check" style="opacity:0;">✓</span>
+              ${
+                savedUsers.length > 0
+                  ? `
+                <!-- Quick 1-Click Access for Saved Accounts -->
+                <div class="auth-saved-users-box">
+                  <span class="auth-saved-users-title">⚡ Quick 1-Click Access (Saved on this device):</span>
+                  <div class="auth-saved-users-list">
+                    ${savedUsers
+                      .map(
+                        (u) => `
+                      <button type="button" class="auth-user-chip" data-user-id="${u.id}" title="Log in as ${u.storeName || u.name}">
+                        <span>${u.role === 'merchant' ? '🏪' : '🛒'}</span>
+                        <strong>${u.storeName || u.name}</strong>
+                        <span style="color:var(--text-muted); font-size:10px;">(${u.role === 'merchant' ? (u.niche || 'Merchant') : 'Buyer'})</span>
+                      </button>
+                    `
+                      )
+                      .join('')}
+                  </div>
                 </div>
-                <span class="role-card-desc">Browse stores by niche & order via direct WhatsApp chat</span>
+              `
+                  : ''
+              }
+
+              <form id="form-auth-login" style="display:flex; flex-direction:column; gap:14px;">
+                <div class="form-group">
+                  <label class="form-label" for="login-identifier">Phone Number, Store Name, or Email</label>
+                  <input
+                    type="text"
+                    id="login-identifier"
+                    class="form-input"
+                    placeholder="e.g. 08023456789, My Store, or name@..."
+                    required
+                    autofocus
+                  />
+                  <span class="form-hint">Matches your registered WhatsApp phone number or store profile</span>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-lg" style="width:100%; margin-top:4px;">
+                  🔑 Log In to ShopKepa
+                </button>
+              </form>
+
+              <!-- Quick Demo Access for immediate exploration -->
+              <div style="border-top:1px solid var(--border-subtle); padding-top:14px;">
+                <button type="button" class="btn-demo-access" id="btn-demo-quick-login">
+                  🚀 Instant Demo Merchant (One-Click Test Store)
+                </button>
+              </div>
+
+              <div style="text-align:center; font-size:var(--text-xs); color:var(--text-secondary);">
+                Don't have an account yet?
+                <button type="button" id="link-switch-to-signup" style="background:none; border:none; color:var(--accent-emerald); font-weight:700; cursor:pointer; text-decoration:underline;">
+                  Create one here →
+                </button>
               </div>
             </div>
-            <input type="hidden" id="auth-role" value="merchant" />
-          </div>
+          `
+              : `
+            <!-- TAB 2: SIGN UP FORM -->
+            <div id="auth-panel-signup" style="display:flex; flex-direction:column; gap:16px;">
+              <div style="text-align:center;">
+                <h2 style="font-size:var(--text-lg); font-weight:800; color:var(--text-primary); margin:0;">
+                  Create Your Free Account
+                </h2>
+                <p style="font-size:var(--text-xs); color:var(--text-secondary); margin:4px 0 0 0;">
+                  Set up your store in 30 seconds to begin tracking stock, sales, and expenses.
+                </p>
+              </div>
 
-          <div class="form-group">
-            <label class="form-label" for="auth-name">Your Full Name</label>
-            <input type="text" id="auth-name" class="form-input" placeholder="e.g. Amaka Okafor" required />
-          </div>
+              <form id="form-auth-setup" style="display:flex; flex-direction:column; gap:16px;">
+                <!-- Role Selector: Merchant vs Buyer -->
+                <div class="form-group">
+                  <label class="form-label">I want to use ShopKepa as a:</label>
+                  <div class="role-selector-row">
+                    <div class="role-card-option active" data-role-select="merchant">
+                      <div class="role-card-header">
+                        <span>🏪 Merchant</span>
+                        <span class="role-radio-check">✓</span>
+                      </div>
+                      <span class="role-card-desc">Sell goods, track stock & debts, publish WhatsApp storefront</span>
+                    </div>
 
-          <!-- Merchant-Specific Niche & Store Fields -->
-          <div id="auth-merchant-fields" style="display:flex; flex-direction:column; gap:14px;">
-            <div class="form-group">
-              <label class="form-label" for="auth-niche">Select Business Niche</label>
-              <select id="auth-niche" class="form-select">
-                <option value="Fashion">👗 Fashion & Apparel</option>
-                <option value="Beauty">💄 Beauty & Cosmetics</option>
-                <option value="Tech Gadgets">📱 Tech Gadgets & Accessories</option>
-                <option value="Foodstuff & Provisions">🥫 Foodstuff & Provisions</option>
-                <option value="Health & Wellness">🌿 Health & Wellness</option>
-                <option value="Home & Living">🏠 Home & Living</option>
-                <option value="Electronics">⚡ Electronics & Appliances</option>
-                <option value="General Merchandise">🎁 General Merchandise</option>
-              </select>
+                    <div class="role-card-option" data-role-select="buyer">
+                      <div class="role-card-header">
+                        <span>🛒 Buyer / Shopper</span>
+                        <span class="role-radio-check" style="opacity:0;">✓</span>
+                      </div>
+                      <span class="role-card-desc">Browse stores by niche & order via direct WhatsApp chat</span>
+                    </div>
+                  </div>
+                  <input type="hidden" id="auth-role" value="merchant" />
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="auth-name">Your Full Name</label>
+                  <input type="text" id="auth-name" class="form-input" placeholder="e.g. Amaka Okafor" required />
+                </div>
+
+                <!-- Merchant-Specific Niche & Store Fields -->
+                <div id="auth-merchant-fields" style="display:flex; flex-direction:column; gap:14px;">
+                  <div class="form-group">
+                    <label class="form-label" for="auth-niche">Select Business Niche</label>
+                    <select id="auth-niche" class="form-select">
+                      <option value="Fashion">👗 Fashion & Apparel</option>
+                      <option value="Beauty">💄 Beauty & Cosmetics</option>
+                      <option value="Tech Gadgets">📱 Tech Gadgets & Accessories</option>
+                      <option value="Foodstuff & Provisions">🥫 Foodstuff & Provisions</option>
+                      <option value="Health & Wellness">🌿 Health & Wellness</option>
+                      <option value="Home & Living">🏠 Home & Living</option>
+                      <option value="Electronics">⚡ Electronics & Appliances</option>
+                      <option value="General Merchandise">🎁 General Merchandise</option>
+                    </select>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label" for="auth-store-name">Store / Business Name</label>
+                    <input type="text" id="auth-store-name" class="form-input" placeholder="e.g. Amaka Glamour Wears" />
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label" for="auth-city">City / Location</label>
+                    <input type="text" id="auth-city" class="form-input" placeholder="e.g. Yaba, Lagos or Abuja" />
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="auth-phone">WhatsApp Phone Number</label>
+                  <input type="tel" id="auth-phone" class="form-input" placeholder="e.g. 08023456789 or +234..." required />
+                  <span class="form-hint">Used for 1-click WhatsApp customer payment reminders & direct orders</span>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="auth-currency">Currency Symbol</label>
+                  <select id="auth-currency" class="form-select">
+                    <option value="₦">₦ - Nigerian Naira</option>
+                    <option value="$">$ - US Dollar</option>
+                    <option value="₵">₵ - Ghana Cedi</option>
+                    <option value="KSh">KSh - Kenya Shilling</option>
+                    <option value="£">£ - British Pound</option>
+                    <option value="€">€ - Euro</option>
+                    <option value="R">R - South African Rand</option>
+                  </select>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-lg" style="width:100%; margin-top:4px;">
+                  ✨ Create Account & Start Selling
+                </button>
+              </form>
+
+              <div style="text-align:center; font-size:var(--text-xs); color:var(--text-secondary);">
+                Already registered on this device?
+                <button type="button" id="link-switch-to-login" style="background:none; border:none; color:var(--accent-emerald); font-weight:700; cursor:pointer; text-decoration:underline;">
+                  Log in here →
+                </button>
+              </div>
             </div>
-
-            <div class="form-group">
-              <label class="form-label" for="auth-store-name">Store / Business Name</label>
-              <input type="text" id="auth-store-name" class="form-input" placeholder="e.g. Amaka Glamour Wears" />
-            </div>
-
-            <div class="form-group">
-              <label class="form-label" for="auth-city">City / Location</label>
-              <input type="text" id="auth-city" class="form-input" placeholder="e.g. Yaba, Lagos or Abuja" />
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="auth-phone">WhatsApp Phone Number</label>
-            <input type="tel" id="auth-phone" class="form-input" placeholder="e.g. 08023456789 or +234..." required />
-            <span class="form-hint">Used for 1-click WhatsApp click-to-chat links</span>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="auth-currency">Currency Symbol</label>
-            <select id="auth-currency" class="form-select">
-              <option value="₦">₦ - Nigerian Naira</option>
-              <option value="$">$ - US Dollar</option>
-              <option value="₵">₵ - Ghana Cedi</option>
-              <option value="KSh">KSh - Kenya Shilling</option>
-              <option value="£">£ - British Pound</option>
-              <option value="€">€ - Euro</option>
-              <option value="R">R - South African Rand</option>
-            </select>
-          </div>
-
-          <button type="submit" class="btn btn-primary btn-lg" style="width:100%; margin-top:6px;">
-            Create Account & Continue
-          </button>
-        </form>
+          `
+          }
+        </div>
 
         <div style="border-top:1px solid var(--border-subtle); padding-top:14px; text-align:center;">
           <a href="#/explore" style="font-size:var(--text-xs); color:var(--text-secondary); text-decoration:none;">
-            ← Continue as Guest to Explore Marketplace
+            🛒 Or Continue as Guest to Browse Marketplace →
           </a>
         </div>
       </div>
     `;
 
-    // Role selector card click events
+    // Tab Switcher Click Listeners
+    document.getElementById('tab-auth-login')?.addEventListener('click', () => {
+      this.authTab = 'login';
+      this.renderAuthPage(container);
+    });
+
+    document.getElementById('tab-auth-signup')?.addEventListener('click', () => {
+      this.authTab = 'signup';
+      this.renderAuthPage(container);
+    });
+
+    document.getElementById('link-switch-to-signup')?.addEventListener('click', () => {
+      this.authTab = 'signup';
+      this.renderAuthPage(container);
+    });
+
+    document.getElementById('link-switch-to-login')?.addEventListener('click', () => {
+      this.authTab = 'login';
+      this.renderAuthPage(container);
+    });
+
+    // 1-Click Access for Saved Accounts
+    document.querySelectorAll('.auth-user-chip').forEach((chip) => {
+      chip.addEventListener('click', (e) => {
+        const userId = (e.currentTarget as HTMLElement).dataset.userId;
+        if (userId) {
+          const user = StorageService.switchUser(userId);
+          if (user) {
+            this.currentUser = user;
+            this.showToast(`Welcome back, ${user.storeName || user.name}!`, 'success');
+            this.navigate(user.role === 'merchant' ? '#/sales' : '#/explore');
+          }
+        }
+      });
+    });
+
+    // Instant Demo Merchant Login
+    document.getElementById('btn-demo-quick-login')?.addEventListener('click', () => {
+      const demoUser = StorageService.createDefaultEmptyMerchant();
+      this.currentUser = demoUser;
+      this.showToast(`Logged into demo merchant "${demoUser.storeName}". Explore freely!`, 'success');
+      this.navigate('#/sales');
+    });
+
+    // Login Form Submit Event
+    document.getElementById('form-auth-login')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const identifierInput = document.getElementById('login-identifier') as HTMLInputElement;
+      const identifier = identifierInput?.value.trim();
+      if (!identifier) return;
+
+      const user = StorageService.login(identifier);
+      if (user) {
+        this.currentUser = user;
+        this.showToast(`Welcome back, ${user.storeName || user.name}!`, 'success');
+        this.navigate(user.role === 'merchant' ? '#/sales' : '#/explore');
+      } else {
+        this.showToast(`No account found matching "${identifier}". Please check spelling or create an account.`, 'danger');
+      }
+    });
+
+    // Sign Up Role Selector Click Events
     const roleCards = document.querySelectorAll('.role-card-option');
     const roleInput = document.getElementById('auth-role') as HTMLInputElement;
     const merchantFields = document.getElementById('auth-merchant-fields');
@@ -4165,7 +4548,7 @@ class MultiPageApp {
       card.addEventListener('click', (e) => {
         const target = e.currentTarget as HTMLElement;
         const selectedRole = target.dataset.roleSelect as UserRole;
-        roleInput.value = selectedRole;
+        if (roleInput) roleInput.value = selectedRole;
 
         roleCards.forEach((c) => {
           c.classList.remove('active');
@@ -4185,15 +4568,16 @@ class MultiPageApp {
       });
     });
 
+    // Sign Up Form Submit Event
     document.getElementById('form-auth-setup')?.addEventListener('submit', (e) => {
       e.preventDefault();
-      const role = (document.getElementById('auth-role') as HTMLInputElement).value as UserRole;
-      const name = (document.getElementById('auth-name') as HTMLInputElement).value;
+      const role = (document.getElementById('auth-role') as HTMLInputElement)?.value as UserRole || 'merchant';
+      const name = (document.getElementById('auth-name') as HTMLInputElement)?.value || 'Merchant';
       const niche = (document.getElementById('auth-niche') as HTMLSelectElement)?.value || 'Fashion';
       const storeName = (document.getElementById('auth-store-name') as HTMLInputElement)?.value;
       const city = (document.getElementById('auth-city') as HTMLInputElement)?.value;
-      const phone = (document.getElementById('auth-phone') as HTMLInputElement).value;
-      const currency = (document.getElementById('auth-currency') as HTMLSelectElement).value;
+      const phone = (document.getElementById('auth-phone') as HTMLInputElement)?.value || '';
+      const currency = (document.getElementById('auth-currency') as HTMLSelectElement)?.value || '₦';
 
       const newUser = StorageService.signup({
         name,
@@ -4247,6 +4631,14 @@ class MultiPageApp {
       link.addEventListener('click', () => {
         this.isNavCollapsed = true;
       });
+    });
+
+    document.getElementById('btn-header-logout')?.addEventListener('click', () => {
+      StorageService.logout();
+      this.currentUser = null;
+      this.authTab = 'login';
+      this.showToast('You have logged out of your store.', 'info');
+      this.navigate('#/auth');
     });
 
     // 0. Recharts Performance Dashboard Mounting
@@ -4505,10 +4897,12 @@ class MultiPageApp {
         if (selectedOption && selectedOption.value) {
           const availableStock = parseInt(selectedOption.dataset.stock || '0', 10);
           const reqQty = parseInt(inputQty.value, 10) || 0;
-          if (reqQty > availableStock) {
-            stockWarning.textContent = `⚠️ Quantity (${reqQty}) exceeds available inventory (${availableStock})!`;
-          } else {
-            stockWarning.textContent = '';
+          if (stockWarning) {
+            if (reqQty > availableStock) {
+              stockWarning.textContent = `⚠️ Quantity (${reqQty}) exceeds available inventory (${availableStock})!`;
+            } else {
+              stockWarning.textContent = '';
+            }
           }
         }
       });
@@ -4523,10 +4917,12 @@ class MultiPageApp {
 
           const availableStock = parseInt(selectedOption.dataset.stock || '0', 10);
           const reqQty = parseInt(inputQty.value, 10) || 0;
-          if (reqQty > availableStock) {
-            stockWarning.textContent = `⚠️ Quantity exceeds available inventory (${availableStock})!`;
-          } else {
-            stockWarning.textContent = '';
+          if (stockWarning) {
+            if (reqQty > availableStock) {
+              stockWarning.textContent = `⚠️ Quantity exceeds available inventory (${availableStock})!`;
+            } else {
+              stockWarning.textContent = '';
+            }
           }
         }
       });
@@ -5490,6 +5886,15 @@ class MultiPageApp {
         }
       });
 
+      // Settings Log Out button
+      document.getElementById('btn-settings-logout')?.addEventListener('click', () => {
+        StorageService.logout();
+        this.currentUser = null;
+        this.authTab = 'login';
+        this.showToast('You have logged out of your store.', 'info');
+        this.navigate('#/auth');
+      });
+
       // Permanent Delete Account Modal Logic
       const deleteModal = document.getElementById('modal-delete-account');
       const inputConfirmDelete = document.getElementById('input-confirm-delete') as HTMLInputElement;
@@ -5568,10 +5973,16 @@ class MultiPageApp {
   }
 }
 
-// Mount application
-document.addEventListener('DOMContentLoaded', () => {
+// Mount application once
+let appInitialized = false;
+function initApp() {
+  if (appInitialized) return;
+  appInitialized = true;
   new MultiPageApp();
-});
-if (document.readyState === 'interactive' || document.readyState === 'complete') {
-  new MultiPageApp();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
 }

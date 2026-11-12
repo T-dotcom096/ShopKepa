@@ -8,141 +8,7 @@ const STORAGE_KEYS = {
   EXPENSES: 'shopkepa_expenses',
 };
 
-// Curated community showcase merchants across various niches
-const COMMUNITY_MERCHANTS: User[] = [
-  {
-    id: 'usr_community_fashion',
-    name: 'Zainab Bello',
-    email: 'zainab@fabrics.local',
-    role: 'merchant',
-    storeName: 'Zainab Luxury Fabrics',
-    niche: 'Fashion',
-    phone: '08031112233',
-    city: 'Lagos Island, Lagos',
-    bio: 'Authentic Swiss lace, Senegalese Kaftans, and bespoke Ankara prints delivered nationwide.',
-    currency: '₦',
-    createdAt: new Date(Date.now() - 86400000 * 12).toISOString(),
-  },
-  {
-    id: 'usr_community_beauty',
-    name: 'Amanda Osei',
-    email: 'amanda@glowbotanics.local',
-    role: 'merchant',
-    storeName: 'Glow Botanicals',
-    niche: 'Beauty',
-    phone: '08124445566',
-    city: 'Wuse 2, Abuja',
-    bio: 'Handcrafted organic skincare, raw whipped shea butter, body glow oils, and herbal facial scrubs.',
-    currency: '₦',
-    createdAt: new Date(Date.now() - 86400000 * 10).toISOString(),
-  },
-  {
-    id: 'usr_community_tech',
-    name: 'Kelechi Okafor',
-    email: 'kelechi@gadgethive.local',
-    role: 'merchant',
-    storeName: 'GadgetHive Tech & Audio',
-    niche: 'Tech Gadgets',
-    phone: '08097778899',
-    city: 'Computer Village, Ikeja',
-    bio: 'High-spec wireless noise-cancelling earbuds, smart fitness watches, and GaN fast charging hubs.',
-    currency: '₦',
-    createdAt: new Date(Date.now() - 86400000 * 8).toISOString(),
-  },
-  {
-    id: 'usr_community_food',
-    name: 'Mama Nkechi',
-    email: 'nkechi@foodstuff.local',
-    role: 'merchant',
-    storeName: 'Nkechi Agro Provisions',
-    niche: 'Foodstuff & Provisions',
-    phone: '08023334455',
-    city: 'Bodija Market, Ibadan',
-    bio: 'Stone-free export grade Ofada rice, pure cold-pressed palm oil, and authentic dried catfish.',
-    currency: '₦',
-    createdAt: new Date(Date.now() - 86400000 * 6).toISOString(),
-  },
-];
-
-const COMMUNITY_PRODUCTS: Product[] = [
-  {
-    id: 'cprod_fashion_1',
-    userId: 'usr_community_fashion',
-    name: 'Vintage Silk Ankara (6 Yards)',
-    price: 18500,
-    stock: 12,
-    category: 'Fashion',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_fashion_2',
-    userId: 'usr_community_fashion',
-    name: 'Embroidered Kaftan Dress',
-    price: 32000,
-    stock: 5,
-    category: 'Fashion',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_beauty_1',
-    userId: 'usr_community_beauty',
-    name: 'Whipped Shea Butter Body Soufflé (250g)',
-    price: 6500,
-    stock: 20,
-    category: 'Beauty',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_beauty_2',
-    userId: 'usr_community_beauty',
-    name: 'Organic Rosehip Glow Serum (30ml)',
-    price: 12000,
-    stock: 8,
-    category: 'Beauty',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_tech_1',
-    userId: 'usr_community_tech',
-    name: 'Pro ANC Wireless Earbuds with Mic',
-    price: 24500,
-    stock: 15,
-    category: 'Tech Gadgets',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_tech_2',
-    userId: 'usr_community_tech',
-    name: '65W GaN Fast Charger (3-Port)',
-    price: 16500,
-    stock: 9,
-    category: 'Tech Gadgets',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'cprod_food_1',
-    userId: 'usr_community_food',
-    name: 'Premium Stone-Free Ofada Rice (5kg)',
-    price: 11500,
-    stock: 18,
-    category: 'Foodstuff & Provisions',
-    image: '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-];
+// Default starter stock for new merchant store setup
 
 export const DEFAULT_MERCHANT_PRODUCTS: Product[] = [
   {
@@ -217,48 +83,48 @@ export class StorageService {
     }
   }
 
-  // --- Initialize Community Directory Merchants ---
-  public static ensureCommunityDirectory(): void {
+  // --- Purge Demo Showcase Stores & Seeded Demo Products ---
+  public static purgeDemoStores(): void {
+    // 1. Purge all demo/community merchants from USERS
     const existingUsers = this.getItem<User[]>(STORAGE_KEYS.USERS, []);
-    const existingIds = new Set(existingUsers.map((u) => u.id));
-
-    let usersModified = false;
-    for (const cm of COMMUNITY_MERCHANTS) {
-      if (!existingIds.has(cm.id)) {
-        existingUsers.push(cm);
-        usersModified = true;
-      }
-    }
-    if (usersModified) {
-      this.setItem(STORAGE_KEYS.USERS, existingUsers);
+    const realUsers = existingUsers.filter((u) => !u.id.startsWith('usr_community_'));
+    if (realUsers.length !== existingUsers.length) {
+      this.setItem(STORAGE_KEYS.USERS, realUsers);
     }
 
+    // 2. Purge all demo community products from PRODUCTS
     const existingProds = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
-    const existingProdIds = new Set(existingProds.map((p) => p.id));
-    let prodsModified = false;
-    for (const cp of COMMUNITY_PRODUCTS) {
-      if (!existingProdIds.has(cp.id)) {
-        existingProds.push(cp);
-        existingProdIds.add(cp.id);
-        prodsModified = true;
-      }
+    const realProds = existingProds.filter(
+      (p) => !p.id.startsWith('cprod_') && !p.userId.startsWith('usr_community_')
+    );
+    if (realProds.length !== existingProds.length) {
+      this.setItem(STORAGE_KEYS.PRODUCTS, realProds);
     }
 
-    // Seed default starter stock for usr_my_merchant if it has 0 products
-    const myProducts = existingProds.filter((p) => p.userId === 'usr_my_merchant');
-    if (myProducts.length === 0) {
-      for (const dp of DEFAULT_MERCHANT_PRODUCTS) {
-        if (!existingProdIds.has(dp.id)) {
-          existingProds.push(dp);
-          existingProdIds.add(dp.id);
-          prodsModified = true;
-        }
+    // 3. Purge from legacy localStorage keys as well
+    try {
+      const legacyUsers = localStorage.getItem('kobotrace_users');
+      if (legacyUsers) {
+        const parsed = JSON.parse(legacyUsers) as User[];
+        const filtered = parsed.filter((u) => !u.id.startsWith('usr_community_'));
+        localStorage.setItem('kobotrace_users', JSON.stringify(filtered));
       }
+      const legacyProds = localStorage.getItem('kobotrace_products');
+      if (legacyProds) {
+        const parsed = JSON.parse(legacyProds) as Product[];
+        const filtered = parsed.filter(
+          (p) => !p.id.startsWith('cprod_') && !p.userId.startsWith('usr_community_')
+        );
+        localStorage.setItem('kobotrace_products', JSON.stringify(filtered));
+      }
+    } catch {
+      // Ignore legacy parsing errors
     }
+  }
 
-    if (prodsModified) {
-      this.setItem(STORAGE_KEYS.PRODUCTS, existingProds);
-    }
+  // Alias for backward compatibility
+  public static ensureCommunityDirectory(): void {
+    this.purgeDemoStores();
   }
 
   // --- Auth / User Management ---
@@ -281,17 +147,47 @@ export class StorageService {
   }
 
   public static getAllMerchants(): User[] {
-    return this.getAllUsers().filter((u) => u.role === 'merchant' && !u.isDeactivated);
+    return this.getAllUsers().filter((u) => {
+      if (u.role !== 'merchant' || u.isDeactivated) return false;
+      // Never expose demo/community merchants
+      if (u.id.startsWith('usr_community_')) return false;
+      // If it's the unconfigured default placeholder account, don't display in public marketplace
+      if (u.id === 'usr_my_merchant' && !u.phone?.trim() && u.storeName === 'My Store') {
+        return false;
+      }
+      return true;
+    });
   }
 
   public static getUserById(userId: string): User | undefined {
     return this.getAllUsers().find((u) => u.id === userId);
   }
 
-  public static login(email: string): User | null {
+  public static login(identifier: string): User | null {
     const users = this.getAllUsers();
-    const cleanEmail = email.trim().toLowerCase();
-    const user = users.find((u) => u.email.toLowerCase() === cleanEmail);
+    const clean = identifier.trim().toLowerCase();
+    const cleanDigits = identifier.replace(/[^0-9]/g, '');
+
+    const user = users.find((u) => {
+      if (u.email && u.email.toLowerCase() === clean) return true;
+      if (u.name && u.name.toLowerCase() === clean) return true;
+      if (u.storeName && u.storeName.toLowerCase() === clean) return true;
+      if (cleanDigits.length >= 7 && u.phone) {
+        const uDigits = u.phone.replace(/[^0-9]/g, '');
+        if (uDigits) {
+          if (uDigits === cleanDigits) return true;
+          if (uDigits.endsWith(cleanDigits) || cleanDigits.endsWith(uDigits)) return true;
+          // Compare last 9 or 10 digits (e.g. 08012345678 vs 2348012345678 both end in 8012345678)
+          const minLen = Math.min(uDigits.length, cleanDigits.length);
+          const compareLen = Math.min(minLen, 9);
+          if (compareLen >= 7 && uDigits.slice(-compareLen) === cleanDigits.slice(-compareLen)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+
     if (user) {
       localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, user.id);
       return user;
@@ -839,6 +735,7 @@ export class StorageService {
   }
 
   public static ensureSeedExpenses(userId: string): void {
+    if (userId !== 'usr_my_merchant') return;
     const all = this.getItem<Expense[]>(STORAGE_KEYS.EXPENSES, []);
     const userExpenses = all.filter((e) => e.userId === userId);
     if (userExpenses.length > 0) return;

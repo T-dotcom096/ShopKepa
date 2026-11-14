@@ -1453,7 +1453,34 @@ class MultiPageApp {
                 + Add Your First Product
               </a>
             </div>`
-          : `<section class="section-toolbar">
+          : `${(() => {
+              const totalStockUnits = products.reduce((sum, p) => sum + (Number(p.stock) || 0), 0);
+              const totalStockValue = products.reduce((sum, p) => sum + (Number(p.price) || 0) * (Number(p.stock) || 0), 0);
+              const pricedProds = products.filter((p) => p.costPrice !== undefined);
+              const totalEstProfit = pricedProds.reduce(
+                (sum, p) => sum + ((Number(p.price) || 0) - (Number(p.costPrice) || 0)) * (Number(p.stock) || 0),
+                0
+              );
+              return `
+              <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-bottom:14px;">
+                <div style="background:var(--bg-surface-elevated); padding:10px 14px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
+                  <div style="font-size:11px; color:var(--text-muted);">Total Stock</div>
+                  <div style="font-size:16px; font-weight:800; color:var(--text-primary);">${formatNumber(totalStockUnits)} units</div>
+                </div>
+                <div style="background:var(--bg-surface-elevated); padding:10px 14px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
+                  <div style="font-size:11px; color:var(--text-muted);">Total Selling Value</div>
+                  <div style="font-size:16px; font-weight:800; color:var(--text-primary); font-family:var(--font-mono);">${formatCurrency(totalStockValue, currency)}</div>
+                </div>
+                <div style="background:var(--bg-surface-elevated); padding:10px 14px; border-radius:var(--radius-md); border:1px solid rgba(16,185,129,0.28);">
+                  <div style="font-size:11px; color:var(--text-muted);">Est. Profit ${pricedProds.length < products.length && pricedProds.length > 0 ? `(${pricedProds.length}/${products.length} priced)` : ''}</div>
+                  <div style="font-size:16px; font-weight:800; font-family:var(--font-mono); color:${pricedProds.length === 0 ? 'var(--text-muted)' : totalEstProfit >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)'};">
+                    ${pricedProds.length === 0 ? 'Add cost prices' : `${totalEstProfit >= 0 ? '+' : ''}${formatCurrency(totalEstProfit, currency)}`}
+                  </div>
+                </div>
+              </div>
+              `;
+            })()}
+            <section class="section-toolbar">
               <div class="search-filter-bar">
                 <div class="search-input-wrapper">
                   <span class="search-icon">🔍</span>
@@ -1495,6 +1522,11 @@ class MultiPageApp {
                           stockBadge = `<span class="badge badge-in-stock">✓ ${product.stock} in stock</span>`;
                         }
 
+                        const hasCost = product.costPrice !== undefined;
+                        const costPrice = product.costPrice ?? 0;
+                        const unitProfit = product.price - costPrice;
+                        const marginPct = product.price > 0 ? Math.round((unitProfit / product.price) * 100) : 0;
+
                         return `
                   <div class="product-card ${product.stock <= lowStockThreshold ? 'border-amber' : ''}">
                     <div class="product-card-image-box">
@@ -1516,6 +1548,20 @@ class MultiPageApp {
                       <div style="margin:4px 0;">
                         ${stockBadge}
                       </div>
+
+                      ${
+                        hasCost
+                          ? `<div class="product-card-profit-row">
+                              <span style="color:var(--text-secondary);">Cost: <strong style="color:var(--text-primary);">${formatCurrency(costPrice, currency)}</strong></span>
+                              <span class="${unitProfit >= 0 ? 'text-emerald' : 'text-rose'}" style="font-weight:700;">
+                                Est. Profit: ${unitProfit >= 0 ? '+' : ''}${formatCurrency(unitProfit, currency)} (${marginPct}%)
+                              </span>
+                            </div>`
+                          : `<div class="product-card-profit-row" style="color:var(--text-muted);">
+                              <span>Cost price not set</span>
+                              <a href="#/edit-product/${product.id}" style="color:var(--accent-emerald); font-weight:600; text-decoration:none;">+ Set cost</a>
+                            </div>`
+                      }
 
                       <div class="product-card-price-row">
                         <span class="product-card-price">${formatCurrency(product.price, currency)}</span>
@@ -1612,21 +1658,49 @@ class MultiPageApp {
 
           <div class="form-grid-2col">
             <div class="form-group">
+              <label class="form-label" for="product-cost-price">Cost Price (${currency})</label>
+              <input type="text" id="product-cost-price" class="form-input" placeholder="0.00" />
+              <span class="form-hint">Your purchase/cost price per unit</span>
+            </div>
+            <div class="form-group">
               <label class="form-label" for="product-price">Selling Price (${currency})</label>
               <input type="text" id="product-price" class="form-input" placeholder="0.00" required />
+              <span class="form-hint">Price customers pay per unit</span>
             </div>
+          </div>
+
+          <!-- Automatic Estimated Profit Calculator -->
+          <div id="product-profit-preview" class="profit-preview-box is-neutral">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+              <span style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-secondary);">
+                📈 Estimated Profit
+              </span>
+              <span id="profit-margin-badge" class="badge badge-paid" style="font-size:10px;">Enter prices</span>
+            </div>
+            <div class="profit-preview-grid">
+              <div class="profit-preview-item">
+                <span class="profit-preview-label">Est. Profit per Unit</span>
+                <span id="profit-per-unit-val" class="profit-preview-value">${formatCurrency(0, currency)}</span>
+              </div>
+              <div class="profit-preview-item">
+                <span class="profit-preview-label">Est. Total Stock Profit (<span id="profit-stock-units">10</span> units)</span>
+                <span id="profit-total-stock-val" class="profit-preview-value">${formatCurrency(0, currency)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-grid-2col">
             <div class="form-group">
               <label class="form-label" for="product-stock">Stock Units Available</label>
               <input type="number" id="product-stock" class="form-input" min="0" placeholder="0" value="10" required />
             </div>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="product-category">Category / Niche Tag</label>
-            <input type="text" id="product-category" class="form-input" value="${defaultNicheCategory}" list="category-suggestions" required />
-            <datalist id="category-suggestions">
-              ${POPULAR_NICHES.map((n) => `<option value="${n}" />`).join('')}
-            </datalist>
+            <div class="form-group">
+              <label class="form-label" for="product-category">Category / Niche Tag</label>
+              <input type="text" id="product-category" class="form-input" value="${defaultNicheCategory}" list="category-suggestions" required />
+              <datalist id="category-suggestions">
+                ${POPULAR_NICHES.map((n) => `<option value="${n}" />`).join('')}
+              </datalist>
+            </div>
           </div>
 
           <!-- HTML FileReader API Image Upload -->
@@ -1700,21 +1774,49 @@ class MultiPageApp {
 
           <div class="form-grid-2col">
             <div class="form-group">
+              <label class="form-label" for="product-cost-price">Cost Price (${currency})</label>
+              <input type="text" id="product-cost-price" class="form-input" placeholder="0.00" value="${product.costPrice !== undefined ? product.costPrice.toFixed(2) : ''}" />
+              <span class="form-hint">Your purchase/cost price per unit</span>
+            </div>
+            <div class="form-group">
               <label class="form-label" for="product-price">Selling Price (${currency})</label>
               <input type="text" id="product-price" class="form-input" value="${product.price.toFixed(2)}" required />
+              <span class="form-hint">Price customers pay per unit</span>
             </div>
+          </div>
+
+          <!-- Automatic Estimated Profit Calculator -->
+          <div id="product-profit-preview" class="profit-preview-box is-neutral">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+              <span style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-secondary);">
+                📈 Estimated Profit
+              </span>
+              <span id="profit-margin-badge" class="badge badge-paid" style="font-size:10px;">Enter prices</span>
+            </div>
+            <div class="profit-preview-grid">
+              <div class="profit-preview-item">
+                <span class="profit-preview-label">Est. Profit per Unit</span>
+                <span id="profit-per-unit-val" class="profit-preview-value">${formatCurrency(0, currency)}</span>
+              </div>
+              <div class="profit-preview-item">
+                <span class="profit-preview-label">Est. Total Stock Profit (<span id="profit-stock-units">${product.stock}</span> units)</span>
+                <span id="profit-total-stock-val" class="profit-preview-value">${formatCurrency(0, currency)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-grid-2col">
             <div class="form-group">
               <label class="form-label" for="product-stock">Stock Units Available</label>
               <input type="number" id="product-stock" class="form-input" min="0" value="${product.stock}" required />
             </div>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label" for="product-category">Category</label>
-            <input type="text" id="product-category" class="form-input" value="${product.category}" list="category-suggestions" required />
-            <datalist id="category-suggestions">
-              ${POPULAR_NICHES.map((n) => `<option value="${n}" />`).join('')}
-            </datalist>
+            <div class="form-group">
+              <label class="form-label" for="product-category">Category</label>
+              <input type="text" id="product-category" class="form-input" value="${product.category}" list="category-suggestions" required />
+              <datalist id="category-suggestions">
+                ${POPULAR_NICHES.map((n) => `<option value="${n}" />`).join('')}
+              </datalist>
+            </div>
           </div>
 
           <div class="form-group">
@@ -4198,21 +4300,16 @@ class MultiPageApp {
   // PAGE: AUTH & ONBOARDING (INTRODUCTORY MESSAGE + LOGIN & SIGN UP FORMS)
   // =========================================================================
   private renderAuthPage(container: HTMLElement): void {
-    const savedUsers = StorageService.getAllUsers().filter((u) => !u.isDeactivated);
-
     container.innerHTML = `
       <div class="auth-container">
         <!-- Return to active session if user clicked Switch -->
         ${
           this.currentUser
             ? `
-          <div style="background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3); border-radius:12px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
-            <div>
-              <span style="font-size:var(--text-xs); color:var(--text-secondary);">Active session:</span>
-              <strong style="color:var(--text-primary); font-size:var(--text-sm); display:block;">
-                ${this.currentUser.role === 'merchant' ? '🏪' : '🛒'} ${this.currentUser.storeName || this.currentUser.name}
-              </strong>
-            </div>
+          <div style="background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <span style="font-size:var(--text-xs); color:var(--text-primary); font-weight:600;">
+              ${this.currentUser.role === 'merchant' ? '🏪' : '🛒'} ${this.currentUser.storeName || this.currentUser.name}
+            </span>
             <a href="${this.currentUser.role === 'merchant' ? '#/sales' : '#/explore'}" class="btn btn-success btn-sm">
               ← Return to Store
             </a>
@@ -4221,58 +4318,18 @@ class MultiPageApp {
             : ''
         }
 
-        <!-- 1. Introductory Message & Value Proposition Hero -->
+        <!-- Concise Introductory Header -->
         <div class="intro-hero">
           <div class="intro-brand-row">
-            <div class="brand-logo-mark" style="width:48px; height:48px; font-size:24px;">₦</div>
+            <div class="brand-logo-mark" style="width:40px; height:40px; font-size:20px;">₦</div>
             <h1 class="intro-hero-title">ShopKepa</h1>
           </div>
-          <div class="intro-hero-tagline">
-            Easy Store & Money Tracker for Everyday Retailers & Merchants
-          </div>
           <p class="intro-hero-desc">
-            Welcome to ShopKepa! An offline-first business companion built to simplify your daily trade.
-            Track cash sales, monitor stock with automatic low-stock notifications, record customer debts,
-            and send 1-click WhatsApp payment reminders with your bank details.
+            Welcome to ShopKepa — your offline-first companion to track daily sales, product profits, inventory, and customer debts.
           </p>
-
-          <!-- 4 Core Feature Pillars -->
-          <div class="intro-features-grid">
-            <div class="intro-feature-card">
-              <span class="intro-feature-icon">📦</span>
-              <div class="intro-feature-text">
-                <strong>Live Inventory Tracking</strong>
-                <span>Real-time stock units on hand with alerts and 1-tap +5 restocks.</span>
-              </div>
-            </div>
-
-            <div class="intro-feature-card">
-              <span class="intro-feature-icon">💬</span>
-              <div class="intro-feature-text">
-                <strong>WhatsApp Debt Reminders</strong>
-                <span>Send pre-filled payment due notices with bank transfer receipts.</span>
-              </div>
-            </div>
-
-            <div class="intro-feature-card">
-              <span class="intro-feature-icon">📊</span>
-              <div class="intro-feature-text">
-                <strong>True Profit Visualizer</strong>
-                <span>Deducts store bills & overheads from sales to show real net profit.</span>
-              </div>
-            </div>
-
-            <div class="intro-feature-card">
-              <span class="intro-feature-icon">⚡</span>
-              <div class="intro-feature-text">
-                <strong>100% Offline-First</strong>
-                <span>Fast and secure. Your records remain private on your device.</span>
-              </div>
-            </div>
-          </div>
         </div>
 
-        <!-- 2. Segmented Mode Switcher: Log In vs Sign Up -->
+        <!-- Clean Mode Switcher: Log In vs Sign Up -->
         <div class="auth-tabs-wrapper">
           <div class="auth-toggle-row" role="tablist">
             <button
@@ -4282,7 +4339,7 @@ class MultiPageApp {
               role="tab"
               aria-selected="${this.authTab === 'login'}"
             >
-              🔑 Log In ${savedUsers.length > 0 ? `(${savedUsers.length})` : ''}
+              Log In
             </button>
             <button
               type="button"
@@ -4291,48 +4348,15 @@ class MultiPageApp {
               role="tab"
               aria-selected="${this.authTab === 'signup'}"
             >
-              ✨ Create New Account
+              Sign Up
             </button>
           </div>
 
-          <!-- TAB 1: LOGIN FORM -->
+          <!-- TAB 1: CLEAN LOGIN FORM -->
           ${
             this.authTab === 'login'
               ? `
-            <div id="auth-panel-login" style="display:flex; flex-direction:column; gap:16px;">
-              <div style="text-align:center;">
-                <h2 style="font-size:var(--text-lg); font-weight:800; color:var(--text-primary); margin:0;">
-                  Welcome Back to Your Store
-                </h2>
-                <p style="font-size:var(--text-xs); color:var(--text-secondary); margin:4px 0 0 0;">
-                  Enter your registered phone number, store name, or email to access your shop.
-                </p>
-              </div>
-
-              ${
-                savedUsers.length > 0
-                  ? `
-                <!-- Quick 1-Click Access for Saved Accounts -->
-                <div class="auth-saved-users-box">
-                  <span class="auth-saved-users-title">⚡ Quick 1-Click Access (Saved on this device):</span>
-                  <div class="auth-saved-users-list">
-                    ${savedUsers
-                      .map(
-                        (u) => `
-                      <button type="button" class="auth-user-chip" data-user-id="${u.id}" title="Log in as ${u.storeName || u.name}">
-                        <span>${u.role === 'merchant' ? '🏪' : '🛒'}</span>
-                        <strong>${u.storeName || u.name}</strong>
-                        <span style="color:var(--text-muted); font-size:10px;">(${u.role === 'merchant' ? (u.niche || 'Merchant') : 'Buyer'})</span>
-                      </button>
-                    `
-                      )
-                      .join('')}
-                  </div>
-                </div>
-              `
-                  : ''
-              }
-
+            <div id="auth-panel-login" style="display:flex; flex-direction:column; gap:14px;">
               <form id="form-auth-login" style="display:flex; flex-direction:column; gap:14px;">
                 <div class="form-group">
                   <label class="form-label" for="login-identifier">Phone Number, Store Name, or Email</label>
@@ -4340,139 +4364,109 @@ class MultiPageApp {
                     type="text"
                     id="login-identifier"
                     class="form-input"
-                    placeholder="e.g. 08023456789, My Store, or name@..."
+                    placeholder="e.g. 08023456789 or My Store"
                     required
                     autofocus
                   />
-                  <span class="form-hint">Matches your registered WhatsApp phone number or store profile</span>
                 </div>
 
-                <button type="submit" class="btn btn-primary btn-lg" style="width:100%; margin-top:4px;">
-                  🔑 Log In to ShopKepa
+                <button type="submit" class="btn btn-primary btn-lg" style="width:100%;">
+                  Log In
                 </button>
               </form>
-
-              <!-- Quick Demo Access for immediate exploration -->
-              <div style="border-top:1px solid var(--border-subtle); padding-top:14px;">
-                <button type="button" class="btn-demo-access" id="btn-demo-quick-login">
-                  🚀 Instant Demo Merchant (One-Click Test Store)
-                </button>
-              </div>
-
-              <div style="text-align:center; font-size:var(--text-xs); color:var(--text-secondary);">
-                Don't have an account yet?
-                <button type="button" id="link-switch-to-signup" style="background:none; border:none; color:var(--accent-emerald); font-weight:700; cursor:pointer; text-decoration:underline;">
-                  Create one here →
-                </button>
-              </div>
             </div>
           `
               : `
-            <!-- TAB 2: SIGN UP FORM -->
-            <div id="auth-panel-signup" style="display:flex; flex-direction:column; gap:16px;">
-              <div style="text-align:center;">
-                <h2 style="font-size:var(--text-lg); font-weight:800; color:var(--text-primary); margin:0;">
-                  Create Your Free Account
-                </h2>
-                <p style="font-size:var(--text-xs); color:var(--text-secondary); margin:4px 0 0 0;">
-                  Set up your store in 30 seconds to begin tracking stock, sales, and expenses.
-                </p>
-              </div>
-
-              <form id="form-auth-setup" style="display:flex; flex-direction:column; gap:16px;">
+            <!-- TAB 2: CLEAN SIGN UP FORM -->
+            <div id="auth-panel-signup" style="display:flex; flex-direction:column; gap:14px;">
+              <form id="form-auth-setup" style="display:flex; flex-direction:column; gap:14px;">
                 <!-- Role Selector: Merchant vs Buyer -->
                 <div class="form-group">
-                  <label class="form-label">I want to use ShopKepa as a:</label>
+                  <label class="form-label">Account Type</label>
                   <div class="role-selector-row">
                     <div class="role-card-option active" data-role-select="merchant">
                       <div class="role-card-header">
                         <span>🏪 Merchant</span>
                         <span class="role-radio-check">✓</span>
                       </div>
-                      <span class="role-card-desc">Sell goods, track stock & debts, publish WhatsApp storefront</span>
+                      <span class="role-card-desc">Manage stock, sales & storefront</span>
                     </div>
 
                     <div class="role-card-option" data-role-select="buyer">
                       <div class="role-card-header">
-                        <span>🛒 Buyer / Shopper</span>
+                        <span>🛒 Buyer</span>
                         <span class="role-radio-check" style="opacity:0;">✓</span>
                       </div>
-                      <span class="role-card-desc">Browse stores by niche & order via direct WhatsApp chat</span>
+                      <span class="role-card-desc">Browse stores & order via WhatsApp</span>
                     </div>
                   </div>
                   <input type="hidden" id="auth-role" value="merchant" />
                 </div>
 
                 <div class="form-group">
-                  <label class="form-label" for="auth-name">Your Full Name</label>
+                  <label class="form-label" for="auth-name">Full Name</label>
                   <input type="text" id="auth-name" class="form-input" placeholder="e.g. Amaka Okafor" required />
                 </div>
 
-                <!-- Merchant-Specific Niche & Store Fields -->
-                <div id="auth-merchant-fields" style="display:flex; flex-direction:column; gap:14px;">
-                  <div class="form-group">
-                    <label class="form-label" for="auth-niche">Select Business Niche</label>
-                    <select id="auth-niche" class="form-select">
-                      <option value="Fashion">👗 Fashion & Apparel</option>
-                      <option value="Beauty">💄 Beauty & Cosmetics</option>
-                      <option value="Tech Gadgets">📱 Tech Gadgets & Accessories</option>
-                      <option value="Foodstuff & Provisions">🥫 Foodstuff & Provisions</option>
-                      <option value="Health & Wellness">🌿 Health & Wellness</option>
-                      <option value="Home & Living">🏠 Home & Living</option>
-                      <option value="Electronics">⚡ Electronics & Appliances</option>
-                      <option value="General Merchandise">🎁 General Merchandise</option>
-                    </select>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="form-label" for="auth-store-name">Store / Business Name</label>
-                    <input type="text" id="auth-store-name" class="form-input" placeholder="e.g. Amaka Glamour Wears" />
+                <!-- Merchant-Specific Fields -->
+                <div id="auth-merchant-fields" style="display:flex; flex-direction:column; gap:12px;">
+                  <div class="form-grid-2col">
+                    <div class="form-group">
+                      <label class="form-label" for="auth-store-name">Store Name</label>
+                      <input type="text" id="auth-store-name" class="form-input" placeholder="e.g. Amaka Wears" />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="auth-niche">Business Niche</label>
+                      <select id="auth-niche" class="form-select">
+                        <option value="Fashion">Fashion & Apparel</option>
+                        <option value="Beauty">Beauty & Cosmetics</option>
+                        <option value="Tech Gadgets">Tech Gadgets</option>
+                        <option value="Foodstuff & Provisions">Foodstuff & Provisions</option>
+                        <option value="Health & Wellness">Health & Wellness</option>
+                        <option value="Home & Living">Home & Living</option>
+                        <option value="Electronics">Electronics</option>
+                        <option value="General Merchandise">General Merchandise</option>
+                      </select>
+                    </div>
                   </div>
 
                   <div class="form-group">
                     <label class="form-label" for="auth-city">City / Location</label>
-                    <input type="text" id="auth-city" class="form-input" placeholder="e.g. Yaba, Lagos or Abuja" />
+                    <input type="text" id="auth-city" class="form-input" placeholder="e.g. Lagos or Abuja" />
                   </div>
                 </div>
 
-                <div class="form-group">
-                  <label class="form-label" for="auth-phone">WhatsApp Phone Number</label>
-                  <input type="tel" id="auth-phone" class="form-input" placeholder="e.g. 08023456789 or +234..." required />
-                  <span class="form-hint">Used for 1-click WhatsApp customer payment reminders & direct orders</span>
+                <div class="form-grid-2col">
+                  <div class="form-group">
+                    <label class="form-label" for="auth-phone">WhatsApp Phone</label>
+                    <input type="tel" id="auth-phone" class="form-input" placeholder="e.g. 08023456789" required />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="auth-currency">Currency</label>
+                    <select id="auth-currency" class="form-select">
+                      <option value="₦">₦ - NGN</option>
+                      <option value="$">$ - USD</option>
+                      <option value="₵">₵ - GHS</option>
+                      <option value="KSh">KSh - KES</option>
+                      <option value="£">£ - GBP</option>
+                      <option value="€">€ - EUR</option>
+                      <option value="R">R - ZAR</option>
+                    </select>
+                  </div>
                 </div>
 
-                <div class="form-group">
-                  <label class="form-label" for="auth-currency">Currency Symbol</label>
-                  <select id="auth-currency" class="form-select">
-                    <option value="₦">₦ - Nigerian Naira</option>
-                    <option value="$">$ - US Dollar</option>
-                    <option value="₵">₵ - Ghana Cedi</option>
-                    <option value="KSh">KSh - Kenya Shilling</option>
-                    <option value="£">£ - British Pound</option>
-                    <option value="€">€ - Euro</option>
-                    <option value="R">R - South African Rand</option>
-                  </select>
-                </div>
-
-                <button type="submit" class="btn btn-primary btn-lg" style="width:100%; margin-top:4px;">
-                  ✨ Create Account & Start Selling
+                <button type="submit" class="btn btn-primary btn-lg" style="width:100%;">
+                  Create Account
                 </button>
               </form>
-
-              <div style="text-align:center; font-size:var(--text-xs); color:var(--text-secondary);">
-                Already registered on this device?
-                <button type="button" id="link-switch-to-login" style="background:none; border:none; color:var(--accent-emerald); font-weight:700; cursor:pointer; text-decoration:underline;">
-                  Log in here →
-                </button>
-              </div>
             </div>
           `
           }
         </div>
 
-        <div style="border-top:1px solid var(--border-subtle); padding-top:14px; text-align:center;">
+        <div style="border-top:1px solid var(--border-subtle); padding-top:12px; text-align:center;">
           <a href="#/explore" style="font-size:var(--text-xs); color:var(--text-secondary); text-decoration:none;">
-            🛒 Or Continue as Guest to Browse Marketplace →
+            Continue as Guest to Browse Marketplace →
           </a>
         </div>
       </div>
@@ -4489,39 +4483,6 @@ class MultiPageApp {
       this.renderAuthPage(container);
     });
 
-    document.getElementById('link-switch-to-signup')?.addEventListener('click', () => {
-      this.authTab = 'signup';
-      this.renderAuthPage(container);
-    });
-
-    document.getElementById('link-switch-to-login')?.addEventListener('click', () => {
-      this.authTab = 'login';
-      this.renderAuthPage(container);
-    });
-
-    // 1-Click Access for Saved Accounts
-    document.querySelectorAll('.auth-user-chip').forEach((chip) => {
-      chip.addEventListener('click', (e) => {
-        const userId = (e.currentTarget as HTMLElement).dataset.userId;
-        if (userId) {
-          const user = StorageService.switchUser(userId);
-          if (user) {
-            this.currentUser = user;
-            this.showToast(`Welcome back, ${user.storeName || user.name}!`, 'success');
-            this.navigate(user.role === 'merchant' ? '#/sales' : '#/explore');
-          }
-        }
-      });
-    });
-
-    // Instant Demo Merchant Login
-    document.getElementById('btn-demo-quick-login')?.addEventListener('click', () => {
-      const demoUser = StorageService.createDefaultEmptyMerchant();
-      this.currentUser = demoUser;
-      this.showToast(`Logged into demo merchant "${demoUser.storeName}". Explore freely!`, 'success');
-      this.navigate('#/sales');
-    });
-
     // Login Form Submit Event
     document.getElementById('form-auth-login')?.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -4535,7 +4496,7 @@ class MultiPageApp {
         this.showToast(`Welcome back, ${user.storeName || user.name}!`, 'success');
         this.navigate(user.role === 'merchant' ? '#/sales' : '#/explore');
       } else {
-        this.showToast(`No account found matching "${identifier}". Please check spelling or create an account.`, 'danger');
+        this.showToast(`No account found matching "${identifier}". Try Sign Up to create one.`, 'danger');
       }
     });
 
@@ -4600,6 +4561,91 @@ class MultiPageApp {
 
       this.navigate(role === 'merchant' ? '#/sales' : '#/explore');
     });
+  }
+
+  private bindProductProfitCalculator(currency: string): void {
+    const inputCost = document.getElementById('product-cost-price') as HTMLInputElement | null;
+    const inputSell = document.getElementById('product-price') as HTMLInputElement | null;
+    const inputStock = document.getElementById('product-stock') as HTMLInputElement | null;
+
+    const previewBox = document.getElementById('product-profit-preview');
+    const marginBadge = document.getElementById('profit-margin-badge');
+    const perUnitVal = document.getElementById('profit-per-unit-val');
+    const totalStockVal = document.getElementById('profit-total-stock-val');
+    const stockUnitsSpan = document.getElementById('profit-stock-units');
+
+    const updateProfitPreview = () => {
+      if (!previewBox || !marginBadge || !perUnitVal || !totalStockVal || !stockUnitsSpan) return;
+
+      const rawCost = inputCost?.value.trim() || '';
+      const rawSell = inputSell?.value.trim() || '';
+      const stockQty = Math.max(0, parseInt(inputStock?.value || '0', 10) || 0);
+      stockUnitsSpan.textContent = String(stockQty);
+
+      if (rawSell === '' && rawCost === '') {
+        previewBox.className = 'profit-preview-box is-neutral';
+        marginBadge.className = 'badge badge-paid';
+        marginBadge.textContent = 'Enter prices';
+        perUnitVal.textContent = formatCurrency(0, currency);
+        perUnitVal.className = 'profit-preview-value';
+        totalStockVal.textContent = formatCurrency(0, currency);
+        totalStockVal.className = 'profit-preview-value';
+        return;
+      }
+
+      const cost = rawCost !== '' ? parseSanitizedNumber(rawCost) : 0;
+      const sell = rawSell !== '' ? parseSanitizedNumber(rawSell) : 0;
+      const unitProfit = sell - cost;
+      const totalProfit = unitProfit * stockQty;
+      const marginPct = sell > 0 ? ((unitProfit / sell) * 100).toFixed(1) : '0.0';
+
+      if (rawCost === '') {
+        previewBox.className = 'profit-preview-box is-neutral';
+        marginBadge.className = 'badge badge-paid';
+        marginBadge.textContent = 'Add cost price';
+        perUnitVal.textContent = formatCurrency(unitProfit, currency);
+        perUnitVal.className = 'profit-preview-value';
+        totalStockVal.textContent = formatCurrency(totalProfit, currency);
+        totalStockVal.className = 'profit-preview-value';
+        return;
+      }
+
+      if (unitProfit > 0) {
+        previewBox.className = 'profit-preview-box';
+        marginBadge.className = 'badge badge-in-stock';
+        marginBadge.textContent = `+${marginPct}% margin`;
+        perUnitVal.textContent = `+${formatCurrency(unitProfit, currency)}`;
+        perUnitVal.className = 'profit-preview-value text-emerald';
+        totalStockVal.textContent = `+${formatCurrency(totalProfit, currency)}`;
+        totalStockVal.className = 'profit-preview-value text-emerald';
+      } else if (unitProfit < 0) {
+        previewBox.className = 'profit-preview-box is-loss';
+        marginBadge.className = 'badge badge-owing';
+        marginBadge.textContent = `Loss (${marginPct}%)`;
+        perUnitVal.textContent = `-${formatCurrency(Math.abs(unitProfit), currency)}`;
+        perUnitVal.className = 'profit-preview-value text-rose';
+        totalStockVal.textContent = `-${formatCurrency(Math.abs(totalProfit), currency)}`;
+        totalStockVal.className = 'profit-preview-value text-rose';
+      } else {
+        previewBox.className = 'profit-preview-box is-neutral';
+        marginBadge.className = 'badge badge-paid';
+        marginBadge.textContent = 'Break-even (0%)';
+        perUnitVal.textContent = formatCurrency(0, currency);
+        perUnitVal.className = 'profit-preview-value';
+        totalStockVal.textContent = formatCurrency(0, currency);
+        totalStockVal.className = 'profit-preview-value';
+      }
+    };
+
+    if (inputCost) {
+      attachNumberSanitizer(inputCost, () => updateProfitPreview());
+    }
+    if (inputSell) {
+      attachNumberSanitizer(inputSell, () => updateProfitPreview());
+    }
+    inputStock?.addEventListener('input', () => updateProfitPreview());
+
+    updateProfitPreview();
   }
 
   // --- Dynamic Event Listeners for Current Page ---
@@ -5107,6 +5153,7 @@ class MultiPageApp {
     // 5. New Product Page Events
     if (path === '#/new-product') {
       const formProduct = document.getElementById('form-new-product-page') as HTMLFormElement;
+      const inputCostPrice = document.getElementById('product-cost-price') as HTMLInputElement;
       const inputProductPrice = document.getElementById('product-price') as HTMLInputElement;
       const fileTrigger = document.getElementById('file-upload-trigger');
       const fileInput = document.getElementById('product-image-file') as HTMLInputElement;
@@ -5114,9 +5161,7 @@ class MultiPageApp {
       const previewImg = document.getElementById('product-image-preview') as HTMLImageElement;
       const btnRemoveImg = document.getElementById('btn-remove-image');
 
-      if (inputProductPrice) {
-        attachNumberSanitizer(inputProductPrice);
-      }
+      this.bindProductProfitCalculator(currency);
 
       fileTrigger?.addEventListener('click', () => fileInput?.click());
 
@@ -5165,6 +5210,8 @@ class MultiPageApp {
         if (!this.currentUser) return;
 
         const name = (document.getElementById('product-name') as HTMLInputElement).value;
+        const rawCostStr = inputCostPrice ? inputCostPrice.value.trim() : '';
+        const costPrice = rawCostStr !== '' ? parseSanitizedNumber(rawCostStr) : undefined;
         const price = parseSanitizedNumber(inputProductPrice.value);
         const stock = parseInt((document.getElementById('product-stock') as HTMLInputElement).value, 10) || 0;
         const category = (document.getElementById('product-category') as HTMLInputElement).value;
@@ -5172,6 +5219,7 @@ class MultiPageApp {
         StorageService.saveProduct({
           userId: this.currentUser.id,
           name,
+          costPrice,
           price,
           stock,
           category,
@@ -5191,6 +5239,7 @@ class MultiPageApp {
     // 6. Edit Product Page Events
     if (path.startsWith('#/edit-product/')) {
       const formEdit = document.getElementById('form-edit-product-page') as HTMLFormElement;
+      const inputCostPrice = document.getElementById('product-cost-price') as HTMLInputElement;
       const inputProductPrice = document.getElementById('product-price') as HTMLInputElement;
       const fileTrigger = document.getElementById('file-upload-trigger');
       const fileInput = document.getElementById('product-image-file') as HTMLInputElement;
@@ -5198,9 +5247,7 @@ class MultiPageApp {
       const previewImg = document.getElementById('product-image-preview') as HTMLImageElement;
       const btnRemoveImg = document.getElementById('btn-remove-image');
 
-      if (inputProductPrice) {
-        attachNumberSanitizer(inputProductPrice);
-      }
+      this.bindProductProfitCalculator(currency);
 
       fileTrigger?.addEventListener('click', () => fileInput?.click());
 
@@ -5250,6 +5297,8 @@ class MultiPageApp {
 
         const id = (document.getElementById('product-id') as HTMLInputElement).value;
         const name = (document.getElementById('product-name') as HTMLInputElement).value;
+        const rawCostStr = inputCostPrice ? inputCostPrice.value.trim() : '';
+        const costPrice = rawCostStr !== '' ? parseSanitizedNumber(rawCostStr) : undefined;
         const price = parseSanitizedNumber(inputProductPrice.value);
         const stock = parseInt((document.getElementById('product-stock') as HTMLInputElement).value, 10) || 0;
         const category = (document.getElementById('product-category') as HTMLInputElement).value;
@@ -5258,6 +5307,7 @@ class MultiPageApp {
           id,
           userId: this.currentUser.id,
           name,
+          costPrice,
           price,
           stock,
           category,

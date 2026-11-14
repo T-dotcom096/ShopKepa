@@ -878,6 +878,18 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
                       </div>
                     </div>
 
+                    {product.costPrice !== undefined && (() => {
+                      const unitProfit = product.price - product.costPrice;
+                      return (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-secondary)', padding: '3px 6px', background: 'rgba(15,23,42,0.45)', borderRadius: '4px' }}>
+                          <span>Cost: {formatCurrency(product.costPrice, currency)}</span>
+                          <span style={{ fontWeight: 700, color: unitProfit >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)' }}>
+                            Est. Profit: {unitProfit >= 0 ? '+' : ''}{formatCurrency(unitProfit, currency)}
+                          </span>
+                        </div>
+                      );
+                    })()}
+
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <div>
                         {isOutOfStock ? (

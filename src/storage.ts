@@ -400,6 +400,10 @@ export class StorageService {
         all[index] = {
           ...all[index],
           ...productData,
+          costPrice:
+            productData.costPrice !== undefined
+              ? Math.max(0, Number(productData.costPrice) || 0)
+              : all[index].costPrice,
           price: Number(productData.price) || 0,
           stock: Math.max(0, parseInt(String(productData.stock), 10) || 0),
           updatedAt: now,
@@ -413,6 +417,8 @@ export class StorageService {
       id: 'prod_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
       userId: productData.userId,
       name: productData.name.trim(),
+      costPrice:
+        productData.costPrice !== undefined ? Math.max(0, Number(productData.costPrice) || 0) : undefined,
       price: Number(productData.price) || 0,
       stock: Math.max(0, parseInt(String(productData.stock), 10) || 0),
       category: productData.category.trim() || 'General',

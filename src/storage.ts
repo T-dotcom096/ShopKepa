@@ -1,4 +1,5 @@
 import { Expense, FinancialSummary, Metrics, Product, Sale, User, UserRole } from './types.ts';
+import { generatePasswordSalt, hashPassword } from './utils.ts';
 
 const STORAGE_KEYS = {
   CURRENT_USER_ID: 'shopkepa_current_user_id',
@@ -6,7 +7,16 @@ const STORAGE_KEYS = {
   PRODUCTS: 'shopkepa_products',
   SALES: 'shopkepa_sales',
   EXPENSES: 'shopkepa_expenses',
+  STOCK_WATCHLIST: 'shopkepa_stock_watchlist',
 };
+
+export interface StockWatchItem {
+  watcherKey: string;
+  productId: string;
+  merchantId: string;
+  stockWhenWatched: number;
+  watchedAt: string;
+}
 
 // Default starter stock for new merchant store setup
 
@@ -57,29 +67,245 @@ export const DEFAULT_MERCHANT_PRODUCTS: Product[] = [
   },
 ];
 
+const IDB_NAME = 'shopkepa_db';
+const IDB_VERSION = 1;
+const IDB_STORE_KV = 'kv';
+const IDB_STORE_IMAGES = 'images';
+
 export class StorageService {
-  private static getItem<T>(key: string, defaultValue: T): T {
+  private static db: IDBDatabase | null = null;
+  private static initPromise: Promise<void> | null = null;
+  private static kvCache: Map<string, unknown> = new Map();
+  private static imageCache: Map<string, string> = new Map();
+
+  public static async init(): Promise<void> {
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this.performInit();
+    return this.initPromise;
+  }
+
+  private static async performInit(): Promise<void> {
+    if (typeof indexedDB === 'undefined') {
+      return;
+    }
+
+    try {
+      this.db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(IDB_STORE_KV)) {
+            db.createObjectStore(IDB_STORE_KV);
+          }
+          if (!db.objectStoreNames.contains(IDB_STORE_IMAGES)) {
+            db.createObjectStore(IDB_STORE_IMAGES);
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+
+      // 1. Hydrate all saved product images into memory cache
+      const storedImages = await this.readAllFromStore<string>(IDB_STORE_IMAGES);
+      storedImages.forEach(([key, val]) => {
+        if (typeof val === 'string' && val) {
+          this.imageCache.set(String(key), val);
+        }
+      });
+
+      // 2. Hydrate all primary collections into memory cache
+      const storedKv = await this.readAllFromStore<unknown>(IDB_STORE_KV);
+      storedKv.forEach(([key, val]) => {
+        this.kvCache.set(String(key), val);
+      });
+
+      // 3. Migrate existing localStorage collections & extract inline Base64 images to IndexedDB
+      const collectionKeys = [
+        STORAGE_KEYS.USERS,
+        STORAGE_KEYS.PRODUCTS,
+        STORAGE_KEYS.SALES,
+        STORAGE_KEYS.EXPENSES,
+        STORAGE_KEYS.STOCK_WATCHLIST,
+      ];
+
+      for (const key of collectionKeys) {
+        if (!this.kvCache.has(key)) {
+          const fromLs = this.readRawLocalStorage<unknown>(key);
+          if (fromLs !== null) {
+            this.kvCache.set(key, fromLs);
+            await this.writeToStore(IDB_STORE_KV, key, fromLs);
+          }
+        }
+      }
+
+      // 4. Automatically offload any inline Base64 images currently inside PRODUCTS into IndexedDB
+      const existingProds = this.kvCache.get(STORAGE_KEYS.PRODUCTS) as Product[] | undefined;
+      if (Array.isArray(existingProds) && existingProds.length > 0) {
+        let migratedAnyImage = false;
+        const offloadedProds: Product[] = [];
+
+        for (const p of existingProds) {
+          if (p.image && !p.image.startsWith('idb://')) {
+            this.imageCache.set(p.id, p.image);
+            await this.writeToStore(IDB_STORE_IMAGES, p.id, p.image);
+            offloadedProds.push({ ...p, image: `idb://${p.id}` });
+            migratedAnyImage = true;
+          } else {
+            offloadedProds.push(p);
+          }
+        }
+
+        if (migratedAnyImage) {
+          this.kvCache.set(STORAGE_KEYS.PRODUCTS, offloadedProds);
+          await this.writeToStore(IDB_STORE_KV, STORAGE_KEYS.PRODUCTS, offloadedProds);
+          try {
+            localStorage.setItem(STORAGE_KEYS.PRODUCTS, JSON.stringify(offloadedProds));
+          } catch {
+            // Best-effort localStorage sync
+          }
+        }
+      }
+    } catch (err) {
+      console.error('IndexedDB initialization fallback to memory/localStorage:', err);
+      this.db = null;
+    }
+  }
+
+  private static readAllFromStore<T>(storeName: string): Promise<Array<[IDBValidKey, T]>> {
+    if (!this.db) return Promise.resolve([]);
+    return new Promise((resolve) => {
+      try {
+        const tx = this.db!.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const results: Array<[IDBValidKey, T]> = [];
+        const req = store.openCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (cursor) {
+            results.push([cursor.key, cursor.value as T]);
+            cursor.continue();
+          } else {
+            resolve(results);
+          }
+        };
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+  }
+
+  private static writeToStore(storeName: string, key: string, value: unknown): Promise<void> {
+    if (!this.db) return Promise.resolve();
+    return new Promise((resolve) => {
+      try {
+        const tx = this.db!.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        store.put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+  }
+
+  private static deleteFromStore(storeName: string, key: string): Promise<void> {
+    if (!this.db) return Promise.resolve();
+    return new Promise((resolve) => {
+      try {
+        const tx = this.db!.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        store.delete(key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+  }
+
+  private static readRawLocalStorage<T>(key: string): T | null {
     try {
       let item = localStorage.getItem(key);
       if (!item && key.startsWith('shopkepa_')) {
         const legacyKey = key.replace('shopkepa_', 'kobotrace_');
         item = localStorage.getItem(legacyKey);
         if (item) {
-          localStorage.setItem(key, item);
+          try {
+            localStorage.setItem(key, item);
+          } catch {
+            // Ignore quota on legacy copy
+          }
         }
       }
-      return item ? JSON.parse(item) : defaultValue;
+      return item ? (JSON.parse(item) as T) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private static offloadProductImage(productId: string, imageData: string): string {
+    if (!imageData) {
+      this.deleteProductImage(productId);
+      return '';
+    }
+    if (imageData.startsWith('idb://')) {
+      return imageData;
+    }
+    if (this.db) {
+      this.imageCache.set(productId, imageData);
+      void this.writeToStore(IDB_STORE_IMAGES, productId, imageData);
+      return `idb://${productId}`;
+    }
+    return imageData;
+  }
+
+  private static deleteProductImage(productId: string): void {
+    this.imageCache.delete(productId);
+    void this.deleteFromStore(IDB_STORE_IMAGES, productId);
+  }
+
+  private static hydrateProduct(product: Product): Product {
+    if (product.image && product.image.startsWith('idb://')) {
+      const refId = product.image.slice(6);
+      const cached = this.imageCache.get(refId);
+      return { ...product, image: cached ?? '' };
+    }
+    return product;
+  }
+
+  private static getItem<T>(key: string, defaultValue: T): T {
+    try {
+      if (this.kvCache.has(key)) {
+        const cached = this.kvCache.get(key) as T;
+        if (Array.isArray(cached)) {
+          return cached.map((entry) =>
+            entry && typeof entry === 'object' ? { ...(entry as Record<string, unknown>) } : entry
+          ) as unknown as T;
+        }
+        return cached;
+      }
+
+      const raw = this.readRawLocalStorage<T>(key);
+      if (raw !== null) {
+        this.kvCache.set(key, raw);
+        return raw;
+      }
+      return defaultValue;
     } catch (e) {
-      console.error(`Error reading ${key} from localStorage:`, e);
+      console.error(`Error reading ${key} from storage:`, e);
       return defaultValue;
     }
   }
 
   private static setItem<T>(key: string, value: T): void {
+    this.kvCache.set(key, value);
+    void this.writeToStore(IDB_STORE_KV, key, value);
     try {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      console.error(`Error writing ${key} to localStorage:`, e);
+    } catch {
+      // If browser localStorage reaches its ~5MB cap, IndexedDB and memory cache still hold all data safely
     }
   }
 
@@ -94,9 +320,14 @@ export class StorageService {
 
     // 2. Purge all demo community products from PRODUCTS
     const existingProds = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
-    const realProds = existingProds.filter(
-      (p) => !p.id.startsWith('cprod_') && !p.userId.startsWith('usr_community_')
-    );
+    const realProds = existingProds.filter((p) => {
+      const isDemo = p.id.startsWith('cprod_') || p.userId.startsWith('usr_community_');
+      if (isDemo) {
+        this.deleteProductImage(p.id);
+        return false;
+      }
+      return true;
+    });
     if (realProds.length !== existingProds.length) {
       this.setItem(STORAGE_KEYS.PRODUCTS, realProds);
     }
@@ -163,12 +394,13 @@ export class StorageService {
     return this.getAllUsers().find((u) => u.id === userId);
   }
 
-  public static login(identifier: string): User | null {
+  private static findUsersByIdentifier(identifier: string): User[] {
     const users = this.getAllUsers();
     const clean = identifier.trim().toLowerCase();
     const cleanDigits = identifier.replace(/[^0-9]/g, '');
+    if (!clean && cleanDigits.length < 7) return [];
 
-    const user = users.find((u) => {
+    return users.filter((u) => {
       if (u.email && u.email.toLowerCase() === clean) return true;
       if (u.name && u.name.toLowerCase() === clean) return true;
       if (u.storeName && u.storeName.toLowerCase() === clean) return true;
@@ -177,7 +409,6 @@ export class StorageService {
         if (uDigits) {
           if (uDigits === cleanDigits) return true;
           if (uDigits.endsWith(cleanDigits) || cleanDigits.endsWith(uDigits)) return true;
-          // Compare last 9 or 10 digits (e.g. 08012345678 vs 2348012345678 both end in 8012345678)
           const minLen = Math.min(uDigits.length, cleanDigits.length);
           const compareLen = Math.min(minLen, 9);
           if (compareLen >= 7 && uDigits.slice(-compareLen) === cleanDigits.slice(-compareLen)) {
@@ -187,12 +418,79 @@ export class StorageService {
       }
       return false;
     });
+  }
 
+  public static login(identifier: string): User | null {
+    const matches = this.findUsersByIdentifier(identifier);
+    const user = matches[0];
     if (user) {
       localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, user.id);
       return user;
     }
     return null;
+  }
+
+  public static async verifyLogin(
+    identifier: string,
+    password: string
+  ): Promise<{
+    status: 'success' | 'not_found' | 'wrong_password' | 'password_too_short';
+    user?: User;
+    setFirstPassword?: boolean;
+  }> {
+    const matches = this.findUsersByIdentifier(identifier);
+    if (matches.length === 0) {
+      return { status: 'not_found' };
+    }
+
+    // 1. Check password against matching accounts that already have password protection
+    for (const candidate of matches) {
+      if (candidate.passwordHash) {
+        const computed = await hashPassword(password, candidate.passwordSalt || '');
+        if (computed === candidate.passwordHash) {
+          localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, candidate.id);
+          return { status: 'success', user: candidate };
+        }
+      }
+    }
+
+    // 2. Legacy accounts created before passwords were required can set their password on first login
+    const legacyAccount = matches.find((u) => !u.passwordHash);
+    if (legacyAccount) {
+      if (!password || password.length < 4) {
+        return { status: 'password_too_short' };
+      }
+      const salt = generatePasswordSalt();
+      const hash = await hashPassword(password, salt);
+      const updated = this.updateUserProfile(legacyAccount.id, {
+        passwordSalt: salt,
+        passwordHash: hash,
+      });
+      if (updated) {
+        localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, updated.id);
+        return { status: 'success', user: updated, setFirstPassword: true };
+      }
+    }
+
+    return { status: 'wrong_password' };
+  }
+
+  public static async verifyUserPassword(userId: string, password: string): Promise<boolean> {
+    const user = this.getUserById(userId);
+    if (!user) return false;
+    if (!user.passwordHash) return true;
+    const computed = await hashPassword(password, user.passwordSalt || '');
+    return computed === user.passwordHash;
+  }
+
+  public static async updatePassword(userId: string, newPassword: string): Promise<User | null> {
+    if (!newPassword || newPassword.length < 4) return null;
+    const salt = generatePasswordSalt();
+    const hash = await hashPassword(newPassword, salt);
+    return this.updateUserProfile(userId, {
+      passwordSalt: salt,
+      passwordHash: hash,
+    });
   }
 
   public static signup(data: {
@@ -205,6 +503,8 @@ export class StorageService {
     city?: string;
     bio?: string;
     currency?: string;
+    passwordHash?: string;
+    passwordSalt?: string;
   }): User {
     const users = this.getAllUsers();
     const cleanEmail = data.email.trim().toLowerCase();
@@ -226,6 +526,8 @@ export class StorageService {
       city: data.city?.trim() || '',
       bio: data.bio?.trim() || '',
       currency: data.currency || '₦',
+      passwordHash: data.passwordHash,
+      passwordSalt: data.passwordSalt,
       createdAt: new Date().toISOString(),
     };
 
@@ -267,12 +569,26 @@ export class StorageService {
 
   public static clearUserData(userId: string): void {
     const allProducts = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
-    const remainingProducts = allProducts.filter((p) => p.userId !== userId);
+    const remainingProducts = allProducts.filter((p) => {
+      if (p.userId === userId) {
+        this.deleteProductImage(p.id);
+        return false;
+      }
+      return true;
+    });
     this.setItem(STORAGE_KEYS.PRODUCTS, remainingProducts);
 
     const allSales = this.getItem<Sale[]>(STORAGE_KEYS.SALES, []);
     const remainingSales = allSales.filter((s) => s.userId !== userId);
     this.setItem(STORAGE_KEYS.SALES, remainingSales);
+
+    const allExpenses = this.getItem<Expense[]>(STORAGE_KEYS.EXPENSES, []);
+    const remainingExpenses = allExpenses.filter((e) => e.userId !== userId);
+    this.setItem(STORAGE_KEYS.EXPENSES, remainingExpenses);
+
+    const watchlist = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []);
+    const remainingWatchlist = watchlist.filter((w) => w.merchantId !== userId);
+    this.setItem(STORAGE_KEYS.STOCK_WATCHLIST, remainingWatchlist);
   }
 
   public static deactivateAccount(userId: string): User | null {
@@ -304,10 +620,14 @@ export class StorageService {
   }
 
   public static deleteAccountPermanently(userId: string): boolean {
-    // 1. Wipe all products
-    const allProducts = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []).filter(
-      (p) => p.userId !== userId
-    );
+    // 1. Wipe all products & their stored images
+    const allProducts = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []).filter((p) => {
+      if (p.userId === userId) {
+        this.deleteProductImage(p.id);
+        return false;
+      }
+      return true;
+    });
     this.setItem(STORAGE_KEYS.PRODUCTS, allProducts);
 
     // 2. Wipe all sales & debts
@@ -322,11 +642,17 @@ export class StorageService {
     );
     this.setItem(STORAGE_KEYS.EXPENSES, allExpenses);
 
-    // 4. Remove user record
+    // 4. Clean up stock watchlist references
+    const watchlist = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []).filter(
+      (w) => w.merchantId !== userId && w.watcherKey !== userId
+    );
+    this.setItem(STORAGE_KEYS.STOCK_WATCHLIST, watchlist);
+
+    // 5. Remove user record
     const allUsers = this.getAllUsers().filter((u) => u.id !== userId);
     this.setItem(STORAGE_KEYS.USERS, allUsers);
 
-    // 5. Clear active session if deleting current user
+    // 6. Clear active session if deleting current user
     const currentId = localStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
     if (currentId === userId) {
       localStorage.removeItem(STORAGE_KEYS.CURRENT_USER_ID);
@@ -380,12 +706,13 @@ export class StorageService {
 
   public static getProducts(userId: string): Product[] {
     const all = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
-    return all.filter((p) => p.userId === userId);
+    return all.filter((p) => p.userId === userId).map((p) => this.hydrateProduct(p));
   }
 
   public static getProduct(productId: string): Product | undefined {
     const all = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
-    return all.find((p) => p.id === productId);
+    const found = all.find((p) => p.id === productId);
+    return found ? this.hydrateProduct(found) : undefined;
   }
 
   public static saveProduct(
@@ -397,9 +724,14 @@ export class StorageService {
     if (productData.id) {
       const index = all.findIndex((p) => p.id === productData.id);
       if (index !== -1) {
+        const storedImageRef = this.offloadProductImage(
+          productData.id,
+          productData.image !== undefined ? productData.image : all[index].image
+        );
         all[index] = {
           ...all[index],
           ...productData,
+          image: storedImageRef,
           costPrice:
             productData.costPrice !== undefined
               ? Math.max(0, Number(productData.costPrice) || 0)
@@ -409,12 +741,15 @@ export class StorageService {
           updatedAt: now,
         } as Product;
         this.setItem(STORAGE_KEYS.PRODUCTS, all);
-        return all[index];
+        return this.hydrateProduct(all[index]);
       }
     }
 
+    const newId = 'prod_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
+    const storedImageRef = this.offloadProductImage(newId, productData.image || '');
+
     const newProduct: Product = {
-      id: 'prod_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
+      id: newId,
       userId: productData.userId,
       name: productData.name.trim(),
       costPrice:
@@ -422,20 +757,27 @@ export class StorageService {
       price: Number(productData.price) || 0,
       stock: Math.max(0, parseInt(String(productData.stock), 10) || 0),
       category: productData.category.trim() || 'General',
-      image: productData.image || '',
+      image: storedImageRef,
       createdAt: now,
       updatedAt: now,
     };
 
     all.unshift(newProduct);
     this.setItem(STORAGE_KEYS.PRODUCTS, all);
-    return newProduct;
+    return this.hydrateProduct(newProduct);
   }
 
   public static deleteProduct(productId: string): void {
+    this.deleteProductImage(productId);
     const all = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
     const filtered = all.filter((p) => p.id !== productId);
     this.setItem(STORAGE_KEYS.PRODUCTS, filtered);
+
+    const watchlist = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []);
+    const filteredWatchlist = watchlist.filter((w) => w.productId !== productId);
+    if (filteredWatchlist.length !== watchlist.length) {
+      this.setItem(STORAGE_KEYS.STOCK_WATCHLIST, filteredWatchlist);
+    }
   }
 
   public static deductStock(productId: string, quantity: number): { success: boolean; newStock: number; product?: Product } {
@@ -448,7 +790,69 @@ export class StorageService {
     all[index].stock = newStock;
     all[index].updatedAt = new Date().toISOString();
     this.setItem(STORAGE_KEYS.PRODUCTS, all);
-    return { success: true, newStock, product: all[index] };
+    return { success: true, newStock, product: this.hydrateProduct(all[index]) };
+  }
+
+  // --- Buyer Stock Watchlist & Restock Tracking ---
+
+  public static getStockWatchlist(watcherKey: string): Array<{
+    watch: StockWatchItem;
+    product: Product;
+    merchant?: User;
+    isBackInStock: boolean;
+  }> {
+    const items = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []).filter(
+      (w) => w.watcherKey === watcherKey
+    );
+    const allProducts = this.getItem<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+    const allUsers = this.getAllUsers();
+
+    const results: Array<{
+      watch: StockWatchItem;
+      product: Product;
+      merchant?: User;
+      isBackInStock: boolean;
+    }> = [];
+
+    for (const watch of items) {
+      const rawProduct = allProducts.find((p) => p.id === watch.productId);
+      if (!rawProduct) continue;
+      const product = this.hydrateProduct(rawProduct);
+      const merchant = allUsers.find((u) => u.id === product.userId);
+      if (merchant?.isDeactivated) continue;
+      const isBackInStock = watch.stockWhenWatched <= 0 && product.stock > 0;
+      results.push({ watch, product, merchant, isBackInStock });
+    }
+
+    return results;
+  }
+
+  public static isProductWatched(watcherKey: string, productId: string): boolean {
+    const items = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []);
+    return items.some((w) => w.watcherKey === watcherKey && w.productId === productId);
+  }
+
+  public static toggleWatchProduct(watcherKey: string, product: Product): boolean {
+    const items = this.getItem<StockWatchItem[]>(STORAGE_KEYS.STOCK_WATCHLIST, []);
+    const existingIdx = items.findIndex(
+      (w) => w.watcherKey === watcherKey && w.productId === product.id
+    );
+
+    if (existingIdx !== -1) {
+      items.splice(existingIdx, 1);
+      this.setItem(STORAGE_KEYS.STOCK_WATCHLIST, items);
+      return false;
+    }
+
+    items.unshift({
+      watcherKey,
+      productId: product.id,
+      merchantId: product.userId,
+      stockWhenWatched: product.stock,
+      watchedAt: new Date().toISOString(),
+    });
+    this.setItem(STORAGE_KEYS.STOCK_WATCHLIST, items);
+    return true;
   }
 
   // --- Sales & Debt Management ---
@@ -659,7 +1063,6 @@ export class StorageService {
   // --- Business Overheads & Expense Tracking ---
 
   public static getExpenses(userId: string): Expense[] {
-    this.ensureSeedExpenses(userId);
     const all = this.getItem<Expense[]>(STORAGE_KEYS.EXPENSES, []);
     return all
       .filter((e) => e.userId === userId)

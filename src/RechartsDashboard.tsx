@@ -25,6 +25,7 @@ interface RechartsDashboardProps {
   products?: Product[];
   currency: string;
   storeName: string;
+  lowStockThreshold?: number;
   onNavigate: (route: string) => void;
   onOpenDebtReminder?: () => void;
   onQuickRestock?: (productId: string) => void;
@@ -35,13 +36,14 @@ type ChartStyle = 'composed' | 'area' | 'bar';
 
 const CATEGORY_COLORS: Record<string, string> = {
   'Generator Fuel & Power': '#f97316',
-  'Stall / Shop Rent': '#3b82f6',
-  'Transport & Logistics': '#06b6d4',
+  'Shop Rent': '#3b82f6',
+  'Delivery & Logistics': '#06b6d4',
+  'Staff Wages & Salaries': '#10b981',
+  'Inventory Procurement': '#6366f1',
   'Packaging & Bags': '#8b5cf6',
-  'Market Levies & Security': '#ec4899',
-  'Repairs & Maintenance': '#eab308',
-  'Staff & Daily Labor': '#10b981',
-  'Stock Purchases': '#6366f1',
+  'Market Levies & Taxes': '#ec4899',
+  'Maintenance & Repairs': '#eab308',
+  'Marketing & Ads': '#14b8a6',
   'General Overheads': '#94a3b8'
 };
 
@@ -53,6 +55,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
   products = [],
   currency,
   storeName,
+  lowStockThreshold = 5,
   onNavigate,
   onOpenDebtReminder,
   onQuickRestock,
@@ -64,7 +67,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
   const inventoryStats = useMemo(() => {
     const list = products || [];
     const totalUnits = list.reduce((sum, p) => sum + (Number(p.stock) || 0), 0);
-    const lowStockItems = list.filter((p) => p.stock > 0 && p.stock <= 5);
+    const lowStockItems = list.filter((p) => p.stock > 0 && p.stock <= lowStockThreshold);
     const outOfStockItems = list.filter((p) => p.stock <= 0);
     return {
       totalProducts: list.length,
@@ -74,7 +77,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
       lowStockItems,
       outOfStockItems,
     };
-  }, [products]);
+  }, [products, lowStockThreshold]);
 
   // Overall financial metrics
   const totals = useMemo(() => {
@@ -228,7 +231,8 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
             boxShadow: '0 10px 25px rgba(0,0,0,0.5)',
             fontSize: '12px',
             color: '#f8fafc',
-            minWidth: '180px'
+            minWidth: '160px',
+            maxWidth: 'calc(100vw - 32px)'
           }}
         >
           <div style={{ fontWeight: 700, marginBottom: '6px', color: '#94a3b8' }}>{label}</div>
@@ -378,9 +382,9 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
           </div>
 
           {/* Controls: Time Horizon & Chart Style */}
-          <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', maxWidth: '100%' }}>
             {/* Time Horizon Toggle */}
-            <div style={{ display: 'flex', background: 'var(--bg-surface-elevated)', borderRadius: 'var(--radius-md)', padding: '3px', border: '1px solid var(--border-subtle)' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', background: 'var(--bg-surface-elevated)', borderRadius: 'var(--radius-md)', padding: '3px', border: '1px solid var(--border-subtle)' }}>
               <button
                 type="button"
                 onClick={() => setTimeHorizon('week')}
@@ -492,7 +496,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
         </div>
 
         {/* Recharts SVG Chart Area */}
-        <div style={{ width: '100%', height: '320px', marginTop: '16px' }}>
+        <div className="recharts-stage-box">
           <ResponsiveContainer width="100%" height="100%">
             {chartStyle === 'composed' ? (
               <ComposedChart data={timelineData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
@@ -586,7 +590,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
       </div>
 
       {/* Lower Row: Expense Breakdown Donut & Business Health Insights */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '16px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(300px, 100%), 1fr))', gap: '16px' }}>
         {/* Expenses by Category Donut Chart */}
         <div className="analytics-card">
           <div className="analytics-card-title">
@@ -739,7 +743,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
             </div>
           </div>
 
-          <div style={{ marginTop: '16px', display: 'flex', gap: '10px' }}>
+          <div style={{ marginTop: '16px', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
             <button
               type="button"
               className="btn btn-primary btn-sm"
@@ -801,7 +805,7 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
         </div>
 
         {/* 4 Summary Chips */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px', marginTop: '14px', marginBottom: '18px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(135px, 100%), 1fr))', gap: '10px', marginTop: '14px', marginBottom: '18px' }}>
           <div style={{ background: 'var(--bg-surface-elevated)', padding: '10px 14px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
             <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Unique Products</div>
             <div style={{ fontSize: '20px', fontWeight: 800, color: 'var(--text-primary)' }}>{inventoryStats.totalProducts}</div>
@@ -843,10 +847,10 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
           </div>
         ) : (
           <div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
+            <div className="dashboard-mini-product-grid">
               {products.slice(0, 8).map((product) => {
                 const isOutOfStock = product.stock <= 0;
-                const isLowStock = product.stock > 0 && product.stock <= 5;
+                const isLowStock = product.stock > 0 && product.stock <= lowStockThreshold;
                 return (
                   <div
                     key={product.id}
@@ -858,10 +862,11 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
                         : isLowStock
                         ? '1px solid rgba(245,158,11,0.4)'
                         : '1px solid var(--border-subtle)',
-                      padding: '12px',
+                      padding: '10px',
                       display: 'flex',
                       flexDirection: 'column',
-                      gap: '8px'
+                      gap: '6px',
+                      minWidth: 0
                     }}
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
@@ -906,10 +911,10 @@ export const RechartsDashboard: React.FC<RechartsDashboardProps> = ({
                           type="button"
                           className="btn btn-secondary btn-sm"
                           style={{ fontSize: '11px', padding: '2px 8px', minHeight: '22px' }}
-                          title="Instantly add +5 units to stock"
+                          title="Add restocked units"
                           onClick={() => onQuickRestock(product.id)}
                         >
-                          +5 Stock
+                          Add Stock
                         </button>
                       )}
                     </div>

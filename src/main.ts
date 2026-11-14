@@ -7,6 +7,8 @@ import { EXPENSE_CATEGORIES, Expense, POPULAR_NICHES, Product, Sale, User, UserR
 import {
   attachNumberSanitizer,
   buildDebtReminderText,
+  copyTextToClipboard,
+  escapeHtml,
   exportBuyerLedgerToCSV,
   exportExpensesToCSV,
   exportSalesToCSV,
@@ -14,9 +16,11 @@ import {
   formatCurrency,
   formatDate,
   formatNumber,
+  generatePasswordSalt,
   generateWhatsAppDebtReminderLink,
   generateWhatsAppOrderLink,
   getDebtDueStatus,
+  hashPassword,
   parseSanitizedNumber,
   requestBrowserNotificationPermission,
   sanitizeWhatsAppPhone,
@@ -28,10 +32,11 @@ class MultiPageApp {
   private currentRoute: string = '';
   private rechartsRoot: Root | null = null;
 
-  // Explore page filters
+  // Explore & storefront filters
   private exploreNicheFilter: string = 'All';
   private exploreSearchQuery: string = '';
   private isNicheCollapsed: boolean = false;
+  private storefrontStockFilter: 'all' | 'in_stock' | 'out_of_stock' = 'all';
 
   // Collapsible bar states (Vertical & Collapsible across entire app)
   private isNavCollapsed: boolean = true;
@@ -116,6 +121,9 @@ class MultiPageApp {
       this.trendChart.destroy();
       this.trendChart = null;
     }
+    if (hash !== this.currentRoute) {
+      this.storefrontStockFilter = 'all';
+    }
     this.currentRoute = hash;
     this.render();
   }
@@ -128,8 +136,20 @@ class MultiPageApp {
     }
   }
 
+  private unmountMountedCharts(): void {
+    if (this.rechartsRoot) {
+      this.rechartsRoot.unmount();
+      this.rechartsRoot = null;
+    }
+    if (this.trendChart) {
+      this.trendChart.destroy();
+      this.trendChart = null;
+    }
+  }
+
   // --- Guest Browsing Shell (Marketplace & WhatsApp Catalog Browsing) ---
   private renderGuestShell(appEl: HTMLElement): void {
+    this.unmountMountedCharts();
     const isStorefront = this.currentRoute.startsWith('#/storefront');
     appEl.innerHTML = `
       <div class="app-container">
@@ -221,6 +241,8 @@ class MultiPageApp {
   public render(): void {
     const appEl = document.getElementById('app');
     if (!appEl) return;
+
+    this.unmountMountedCharts();
 
     const isPublicRoute = this.currentRoute === '#/explore' || this.currentRoute.startsWith('#/storefront');
     if (!this.currentUser) {
@@ -361,6 +383,14 @@ class MultiPageApp {
 
         <!-- Dynamic Multi-Page Router View -->
         <main id="page-viewport" style="display:flex; flex-direction:column; gap:20px;">
+          ${
+            this.currentUser.isDeactivated
+              ? `<div class="deactivated-banner">
+                   <span>⏸️ <strong>Your storefront is currently deactivated</strong> and hidden from Marketplace buyers.</span>
+                   <button type="button" id="btn-banner-reactivate" class="btn btn-success btn-sm">▶️ Reactivate Store</button>
+                 </div>`
+              : ''
+          }
           ${this.renderCurrentPageView(sales, products, metrics)}
         </main>
 
@@ -417,7 +447,19 @@ class MultiPageApp {
   // --- Page View Router ---
   private renderCurrentPageView(sales: Sale[], products: Product[], metrics: any): string {
     const rawRoute = this.currentRoute || (this.currentUser?.role === 'buyer' ? '#/explore' : '#/dashboard');
-    const [path] = rawRoute.split('?');
+    const [path, queryString] = rawRoute.split('?');
+
+    // Enforce buyer route scope so buyers don't accidentally view merchant-only internal routes
+    if (this.currentUser?.role === 'buyer') {
+      if (path === '#/buyer-ledger') {
+        return this.renderBuyerLedgerPageHTML();
+      } else if (path === '#/settings') {
+        return this.renderSettingsPageHTML();
+      } else if (path === '#/storefront' && new URLSearchParams(queryString || '').get('merchant')) {
+        return this.renderStorefrontPageHTML(products);
+      }
+      return this.renderExplorePageHTML();
+    }
 
     if (path === '#/dashboard') {
       return this.renderDashboardPageHTML();
@@ -493,20 +535,91 @@ class MultiPageApp {
       );
     }
 
+    const watcherKey = this.currentUser?.id || 'guest';
+    const watchlist = StorageService.getStockWatchlist(watcherKey);
+    const backInStockItems = watchlist.filter((item) => item.isBackInStock);
+
     return `
       <!-- Page Header Row -->
       <div class="page-header-row">
         <div class="page-title-group">
           <h1>Explore Marketplace & Merchants</h1>
-          <p>Discover verified merchants across various niches and chat directly via WhatsApp.</p>
+          <p>Discover verified merchants across various niches, track product stock, and order via WhatsApp.</p>
         </div>
 
         ${
           this.currentUser?.role === 'buyer'
             ? `<span class="badge badge-paid">🛒 Shopper Mode Active</span>`
-            : `<a href="#/storefront" class="btn btn-secondary btn-sm">👁️ View My Storefront</a>`
+            : this.currentUser?.role === 'merchant'
+            ? `<a href="#/storefront" class="btn btn-secondary btn-sm">👁️ View My Storefront</a>`
+            : `<span class="badge badge-paid">🌐 Guest Browsing</span>`
         }
       </div>
+
+      ${
+        watchlist.length > 0
+          ? `
+        <!-- Buyer Tracked Products & Live Stock Alerts -->
+        <section class="alert-banner-box" style="margin-bottom:16px; border-color:${backInStockItems.length > 0 ? 'rgba(16,185,129,0.45)' : 'var(--border-strong)'}; background:${backInStockItems.length > 0 ? 'rgba(16,185,129,0.08)' : 'var(--bg-surface)'};">
+          <div class="alert-banner-header">
+            <div class="alert-banner-title">
+              <span>${backInStockItems.length > 0 ? `🎉 ${backInStockItems.length} Tracked Product(s) Back in Stock!` : `🔔 Tracked Products (${watchlist.length})`}</span>
+            </div>
+            <span style="font-size:11px; color:var(--text-secondary);">Live stock status updates automatically</span>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+            ${watchlist
+              .map(({ product, merchant, isBackInStock }) => {
+                const storeTitle = merchant?.storeName || merchant?.name || 'Store';
+                const prodCurrency = merchant?.currency || currency;
+                const statusBadge =
+                  product.stock <= 0
+                    ? `<span class="badge badge-out-of-stock">🚨 Out of Stock</span>`
+                    : isBackInStock
+                    ? `<span class="badge badge-in-stock">🎉 Back in Stock (${product.stock})</span>`
+                    : product.stock < 5
+                    ? `<span class="badge badge-low-stock">⚠️ Low Stock (${product.stock} left)</span>`
+                    : `<span class="badge badge-in-stock">✓ In Stock (${product.stock})</span>`;
+
+                const waLink = merchant?.phone
+                  ? generateWhatsAppOrderLink({
+                      phone: merchant.phone,
+                      storeName: storeTitle,
+                      productName: product.name,
+                      price: product.price,
+                      currency: prodCurrency,
+                    })
+                  : '';
+
+                return `
+                  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding:10px 12px; background:var(--bg-surface-elevated); border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
+                    <div style="display:flex; flex-direction:column; gap:2px;">
+                      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <strong style="font-size:var(--text-sm); color:var(--text-primary);">${product.name}</strong>
+                        ${statusBadge}
+                      </div>
+                      <span style="font-size:11px; color:var(--text-secondary);">
+                        ${storeTitle} • <strong>${formatCurrency(product.price, prodCurrency)}</strong>
+                      </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                      <a href="#/storefront?merchant=${product.userId}" class="btn btn-secondary btn-sm">View Store</a>
+                      ${
+                        product.stock > 0 && waLink
+                          ? `<a href="${waLink}" target="_blank" rel="noopener noreferrer" class="btn btn-whatsapp btn-sm">💬 Order</a>`
+                          : ''
+                      }
+                      <button type="button" class="btn btn-secondary btn-sm btn-unwatch-product" data-product-id="${product.id}" title="Stop tracking this product" style="padding:4px 8px;">✕</button>
+                    </div>
+                  </div>
+                `;
+              })
+              .join('')}
+          </div>
+        </section>
+      `
+          : ''
+      }
 
       <!-- Search & Niche Filter Bar -->
       <section class="section-toolbar" style="gap:16px;">
@@ -517,7 +630,7 @@ class MultiPageApp {
             id="explore-search-input"
             class="search-input"
             placeholder="Search stores by name, niche, location (e.g. Lagos, Fashion, Gadgets)..."
-            value="${this.exploreSearchQuery}"
+            value="${escapeHtml(this.exploreSearchQuery)}"
           />
         </div>
       </section>
@@ -583,98 +696,125 @@ class MultiPageApp {
       </section>
 
       <!-- Merchants Directory Grid -->
-      <div class="merchant-grid">
-        ${
-          allMerchants.length === 0
-            ? `<div class="empty-state" style="grid-column:1 / -1; padding:48px 24px; border:1px dashed var(--border-subtle); border-radius:var(--radius-lg);">
-                <span class="empty-state-icon">🏪</span>
-                <h3 style="font-size:var(--text-lg); margin-top:8px;">No Public Stores Published Yet</h3>
-                <p style="max-width:480px; margin:8px auto; color:var(--text-secondary); line-height:1.6;">
-                  All demo showcase stores have been cleared. As real verified merchants register and configure their store contact details, they will appear here for buyers to browse and place WhatsApp orders.
-                </p>
-                ${
-                  this.currentUser?.role === 'merchant'
-                    ? `<a href="#/settings" class="btn btn-primary btn-sm" style="margin-top:12px;">
-                         ⚙️ Set Up Your Store Profile to Publish Here
-                       </a>`
-                    : `<a href="#/auth" class="btn btn-primary btn-sm" style="margin-top:12px;">
-                         + Register Your Store on ShopKepa
-                       </a>`
-                }
-               </div>`
-            : filtered.length === 0
-            ? `<div class="empty-state" style="grid-column:1 / -1;">
-                <span class="empty-state-icon">🔍</span>
-                <h3>No merchants found</h3>
-                <p>No verified stores found matching your search in the "${this.exploreNicheFilter}" niche.</p>
-                <button id="btn-reset-explore-filters" class="btn btn-secondary btn-sm" style="margin-top:8px;">
-                  Show All Stores
-                </button>
-               </div>`
-            : filtered
-                .map((merchant) => {
-                  const merchantProds = StorageService.getProducts(merchant.id);
-                  const isSelf = merchant.id === this.currentUser?.id;
-
-                  // Clean WhatsApp message
-                  const waPhone = sanitizeWhatsAppPhone(merchant.phone);
-                  const waMessage = encodeURIComponent(
-                    `Hello ${merchant.storeName || merchant.name}! 🛍️\nI found your store on ShopKepa (${merchant.niche || 'Marketplace'}). I would like to inquire about your products!`
-                  );
-                  const waLink = `https://wa.me/${waPhone}?text=${waMessage}`;
-
-                  return `
-            <div class="merchant-card">
-              <div class="merchant-card-header">
-                <div>
-                  <h2 class="merchant-card-title">${merchant.storeName || merchant.name}</h2>
-                  <div class="merchant-card-owner">
-                    by <strong>${merchant.name}</strong> • ${merchant.city || 'Nigeria'}
-                  </div>
-                </div>
-                <span class="badge badge-niche">
-                  ${merchant.niche || 'Merchant'}
-                </span>
-              </div>
-
-              <p class="merchant-card-bio">
-                ${merchant.bio || 'Verified micro-merchant on ShopKepa. Contact for instant WhatsApp ordering.'}
-              </p>
-
-              <div class="merchant-card-meta">
-                <span>📦 <strong>${merchantProds.length}</strong> Products Catalog</span>
-                <span>${merchant.phone ? `📞 ${merchant.phone}` : 'No phone listed'}</span>
-              </div>
-
-              <div class="merchant-card-actions">
-                ${
-                  merchant.phone
-                    ? `<a
-                        href="${waLink}"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        class="btn btn-whatsapp btn-sm"
-                        style="flex:1; text-decoration:none;"
-                      >
-                        💬 Chat on WhatsApp
-                      </a>`
-                    : `<button class="btn btn-secondary btn-sm" disabled style="flex:1;">No WhatsApp</button>`
-                }
-                <a
-                  href="#/storefront?merchant=${merchant.id}"
-                  class="btn btn-secondary btn-sm"
-                  title="View this merchant's digital catalog"
-                >
-                  View Catalog
-                </a>
-              </div>
-            </div>
-          `;
-                })
-                .join('')
-        }
+      <div class="merchant-grid" id="explore-merchant-grid">
+        ${this.renderExploreGridInnerHTML(allMerchants, filtered)}
       </div>
     `;
+  }
+
+  private renderExploreGridInnerHTML(allMerchantsInput?: User[], filteredInput?: User[]): string {
+    const allMerchants = allMerchantsInput || StorageService.getAllMerchants();
+    let filtered = filteredInput;
+    if (!filtered) {
+      filtered = allMerchants;
+      if (this.exploreNicheFilter !== 'All') {
+        filtered = filtered.filter(
+          (m) => (m.niche || '').toLowerCase() === this.exploreNicheFilter.toLowerCase()
+        );
+      }
+      if (this.exploreSearchQuery.trim()) {
+        const q = this.exploreSearchQuery.toLowerCase();
+        filtered = filtered.filter(
+          (m) =>
+            (m.storeName || '').toLowerCase().includes(q) ||
+            m.name.toLowerCase().includes(q) ||
+            (m.niche || '').toLowerCase().includes(q) ||
+            (m.city || '').toLowerCase().includes(q) ||
+            (m.bio || '').toLowerCase().includes(q)
+        );
+      }
+    }
+
+    if (allMerchants.length === 0) {
+      return `<div class="empty-state" style="grid-column:1 / -1; padding:48px 24px; border:1px dashed var(--border-subtle); border-radius:var(--radius-lg);">
+        <span class="empty-state-icon">🏪</span>
+        <h3 style="font-size:var(--text-lg); margin-top:8px;">No Public Stores Published Yet</h3>
+        <p style="max-width:480px; margin:8px auto; color:var(--text-secondary); line-height:1.6;">
+          All demo showcase stores have been cleared. As real verified merchants register and configure their store contact details, they will appear here for buyers to browse and place WhatsApp orders.
+        </p>
+        ${
+          this.currentUser?.role === 'merchant'
+            ? `<a href="#/settings" class="btn btn-primary btn-sm" style="margin-top:12px;">
+                 ⚙️ Set Up Your Store Profile to Publish Here
+               </a>`
+            : `<a href="#/auth" class="btn btn-primary btn-sm" style="margin-top:12px;">
+                 + Register Your Store on ShopKepa
+               </a>`
+        }
+       </div>`;
+    }
+
+    if (filtered.length === 0) {
+      return `<div class="empty-state" style="grid-column:1 / -1;">
+        <span class="empty-state-icon">🔍</span>
+        <h3>No merchants found</h3>
+        <p>No verified stores found matching your search in the "${this.exploreNicheFilter}" niche.</p>
+        <button id="btn-reset-explore-filters" class="btn btn-secondary btn-sm" style="margin-top:8px;">
+          Show All Stores
+        </button>
+       </div>`;
+    }
+
+    return filtered
+      .map((merchant) => {
+        const merchantProds = StorageService.getProducts(merchant.id);
+        const inStockCount = merchantProds.filter((p) => p.stock > 0).length;
+
+        const waPhone = sanitizeWhatsAppPhone(merchant.phone);
+        const waMessage = encodeURIComponent(
+          `Hello ${merchant.storeName || merchant.name}!\nI found your store on ShopKepa (${merchant.niche || 'Marketplace'}). I would like to inquire about your products.`
+        );
+        const waLink = `https://wa.me/${waPhone}?text=${waMessage}`;
+
+        return `
+  <div class="merchant-card">
+    <div class="merchant-card-header">
+      <div>
+        <h2 class="merchant-card-title">${merchant.storeName || merchant.name}</h2>
+        <div class="merchant-card-owner">
+          by <strong>${merchant.name}</strong> • ${merchant.city || 'Nigeria'}
+        </div>
+      </div>
+      <span class="badge badge-niche">
+        ${merchant.niche || 'Merchant'}
+      </span>
+    </div>
+
+    <p class="merchant-card-bio">
+      ${merchant.bio || 'Verified micro-merchant on ShopKepa. Contact for instant WhatsApp ordering.'}
+    </p>
+
+    <div class="merchant-card-meta">
+      <span>📦 <strong>${inStockCount}</strong> In Stock (${merchantProds.length} Listed)</span>
+      <span>${merchant.phone ? `📞 ${merchant.phone}` : 'No phone listed'}</span>
+    </div>
+
+    <div class="merchant-card-actions">
+      ${
+        merchant.phone
+          ? `<a
+              href="${waLink}"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="btn btn-whatsapp btn-sm"
+              style="flex:1; text-decoration:none;"
+            >
+              💬 Chat on WhatsApp
+            </a>`
+          : `<button class="btn btn-secondary btn-sm" disabled style="flex:1;">No WhatsApp</button>`
+      }
+      <a
+        href="#/storefront?merchant=${merchant.id}"
+        class="btn btn-secondary btn-sm"
+        title="View this merchant's digital catalog"
+      >
+        View Catalog
+      </a>
+    </div>
+  </div>
+`;
+      })
+      .join('');
   }
 
   // =========================================================================
@@ -703,11 +843,44 @@ class MultiPageApp {
     const cleanPhone = sanitizeWhatsAppPhone(phone);
     const storeName = targetMerchant.storeName || targetMerchant.name;
     const niche = targetMerchant.niche || 'General';
+    const storeCurrency = targetMerchant.currency || currency;
+    const watcherKey = this.currentUser?.id || 'guest';
+
+    const inStockCount = storeProducts.filter((p) => p.stock > 0).length;
+    const outOfStockCount = storeProducts.filter((p) => p.stock <= 0).length;
+
+    const restockedHere = StorageService.getStockWatchlist(watcherKey).filter(
+      (item) => item.product.userId === targetMerchant.id && item.isBackInStock
+    );
+
+    let visibleProducts = storeProducts;
+    if (this.storefrontStockFilter === 'in_stock') {
+      visibleProducts = storeProducts.filter((p) => p.stock > 0);
+    } else if (this.storefrontStockFilter === 'out_of_stock') {
+      visibleProducts = storeProducts.filter((p) => p.stock <= 0);
+    }
 
     return `
       ${
         isViewingOther
           ? `<div><a href="#/explore" class="page-back-link">← Back to Explore Marketplace</a></div>`
+          : ''
+      }
+
+      ${
+        restockedHere.length > 0
+          ? `
+        <div class="alert-banner-box" style="margin-bottom:14px; border-color:rgba(16,185,129,0.45); background:rgba(16,185,129,0.08);">
+          <div class="alert-banner-header">
+            <div class="alert-banner-title">
+              <span>🎉 Back in Stock at ${storeName}!</span>
+            </div>
+          </div>
+          <p class="alert-banner-desc" style="margin-top:4px;">
+            Products you tracked are now available: <strong>${restockedHere.map((r) => `${r.product.name} (${r.product.stock} left)`).join(', ')}</strong>.
+          </p>
+        </div>
+      `
           : ''
       }
 
@@ -750,6 +923,25 @@ class MultiPageApp {
       </section>
 
       ${
+        storeProducts.length > 0
+          ? `
+        <!-- Buyer Stock Availability Filter -->
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <button type="button" class="btn btn-sm ${this.storefrontStockFilter === 'all' ? 'btn-primary' : 'btn-secondary'} storefront-stock-filter-btn" data-stock-filter="all">
+            All Items (${storeProducts.length})
+          </button>
+          <button type="button" class="btn btn-sm ${this.storefrontStockFilter === 'in_stock' ? 'btn-primary' : 'btn-secondary'} storefront-stock-filter-btn" data-stock-filter="in_stock">
+            ✓ In Stock (${inStockCount})
+          </button>
+          <button type="button" class="btn btn-sm ${this.storefrontStockFilter === 'out_of_stock' ? 'btn-primary' : 'btn-secondary'} storefront-stock-filter-btn" data-stock-filter="out_of_stock">
+            Out of Stock (${outOfStockCount})
+          </button>
+        </div>
+      `
+          : ''
+      }
+
+      ${
         storeProducts.length === 0
           ? `<!-- Clean Empty State When User Has Not Filled Any Products -->
             <div class="empty-state">
@@ -766,16 +958,24 @@ class MultiPageApp {
                   : `<a href="#/explore" class="btn btn-secondary btn-sm" style="margin-top:8px;">Browse Other Stores</a>`
               }
             </div>`
+          : visibleProducts.length === 0
+          ? `<div class="empty-state">
+              <span class="empty-state-icon">📦</span>
+              <h3>No products match this stock filter</h3>
+              <p>${this.storefrontStockFilter === 'in_stock' ? 'No items are currently in stock. Track out-of-stock items to get alerted when restocked.' : 'All items in this store are currently in stock!'}</p>
+              <button type="button" class="btn btn-secondary btn-sm storefront-stock-filter-btn" data-stock-filter="all" style="margin-top:8px;">
+                Show All Items
+              </button>
+            </div>`
           : `<div class="product-grid">
-              ${storeProducts
+              ${visibleProducts
                 .map((product) => {
                   const waLink = generateWhatsAppOrderLink({
                     phone,
                     storeName,
                     productName: product.name,
                     price: product.price,
-                    currency,
-                    stock: product.stock,
+                    currency: storeCurrency,
                   });
 
                   const stockStatusText =
@@ -786,6 +986,7 @@ class MultiPageApp {
                       : `In Stock (${product.stock})`;
 
                   const isOut = product.stock === 0;
+                  const isWatched = StorageService.isProductWatched(watcherKey, product.id);
 
                   return `
                 <div class="product-card" style="border: 1px solid rgba(37, 211, 102, 0.25);">
@@ -803,33 +1004,41 @@ class MultiPageApp {
                         <h3 class="product-card-title">${product.name}</h3>
                         <span class="product-card-category">${product.category}</span>
                       </div>
+                    </div>
+
+                    <div style="margin:2px 0;">
                       <span class="badge ${isOut ? 'badge-out-of-stock' : product.stock < 5 ? 'badge-low-stock' : 'badge-in-stock'}">
                         ${stockStatusText}
                       </span>
                     </div>
 
                     <div class="product-card-price-row">
-                      <span class="product-card-price text-emerald">${formatCurrency(product.price, currency)}</span>
-                      <span style="font-size:var(--text-xs); color:var(--text-muted);">Direct Price</span>
+                      <span class="product-card-price text-emerald">${formatCurrency(product.price, storeCurrency)}</span>
                     </div>
 
-                    <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+                    <div style="display:flex; flex-direction:column; gap:6px; margin-top:6px;">
                       <a
                         href="${waLink}"
                         target="_blank"
                         rel="noopener noreferrer"
-                        class="btn btn-whatsapp"
+                        class="btn btn-whatsapp btn-sm"
                         style="width:100%; text-decoration:none;"
                       >
-                        💬 Order via WhatsApp
+                        💬 ${isOut ? 'Inquire' : 'Order'}
                       </a>
-                      <button
-                        class="btn btn-secondary btn-sm btn-copy-wa-link"
-                        data-wa-link="${encodeURIComponent(waLink)}"
-                        style="width:100%;"
-                      >
-                        🔗 Copy Order Link
-                      </button>
+                      ${
+                        isViewingOther
+                          ? `<button
+                              type="button"
+                              class="btn btn-sm ${isWatched ? 'btn-primary' : 'btn-secondary'} btn-toggle-watch-product"
+                              data-product-id="${product.id}"
+                              style="width:100%;"
+                              title="${isWatched ? 'Tracking live stock & restocks' : 'Track stock status & restock alerts'}"
+                            >
+                              ${isWatched ? '🔔 Tracking' : '🔔 Track'}
+                            </button>`
+                          : ''
+                      }
                     </div>
                   </div>
                 </div>
@@ -1077,7 +1286,7 @@ class MultiPageApp {
                     id="sales-search-input"
                     class="search-input"
                     placeholder="Search by customer name, item, or phone number..."
-                    value="${this.salesSearchQuery}"
+                    value="${escapeHtml(this.salesSearchQuery)}"
                   />
                 </div>
               </div>
@@ -1145,111 +1354,143 @@ class MultiPageApp {
                     <th style="text-align:right;">Actions</th>
                   </tr>
                 </thead>
-                <tbody>
-                  ${
-                    filtered.length === 0
-                      ? `<tr><td colspan="7"><div class="empty-state" style="border:none; margin:16px auto;">
-                          <p>No transactions match your search filter.</p>
-                         </div></td></tr>`
-                      : filtered
-                          .map((sale) => {
-                            const isPaid = sale.status === 'completed';
-                            const dueInfo = getDebtDueStatus(sale.dueDate);
-
-                            let badgeHtml = '';
-                            if (isPaid) {
-                              badgeHtml = `<span class="badge badge-paid">✓ Paid</span>`;
-                            } else if (dueInfo.status === 'overdue') {
-                              badgeHtml = `
-                                <div>
-                                  <span class="badge badge-overdue">⚠️ ${dueInfo.label}</span>
-                                  <div style="font-size:10px; color:#fb7185; margin-top:2px;">Due: ${sale.dueDate}</div>
-                                </div>
-                              `;
-                            } else if (dueInfo.status === 'due_today') {
-                              badgeHtml = `
-                                <div>
-                                  <span class="badge badge-due-today">⏳ Due Today</span>
-                                  <div style="font-size:10px; color:#fbbf24; margin-top:2px;">Due: ${sale.dueDate}</div>
-                                </div>
-                              `;
-                            } else if (dueInfo.status === 'upcoming') {
-                              badgeHtml = `
-                                <div>
-                                  <span class="badge badge-upcoming">📅 ${dueInfo.label}</span>
-                                  <div style="font-size:10px; color:var(--text-muted); margin-top:2px;">Due: ${sale.dueDate}</div>
-                                </div>
-                              `;
-                            } else {
-                              badgeHtml = `<span class="badge badge-pending">⏳ Pending Debt</span>`;
-                            }
-
-                            return `
-                        <tr>
-                          <td style="color:var(--text-secondary); font-size:var(--text-xs);">
-                            ${formatDate(sale.createdAt)}
-                          </td>
-                          <td>
-                            <div style="font-weight:700;">${sale.customerName}</div>
-                            ${sale.customerPhone ? `<div style="font-size:var(--text-xs); color:var(--text-muted);">${sale.customerPhone}</div>` : ''}
-                          </td>
-                          <td>
-                            <div style="font-size:var(--text-xs);">
-                              ${sale.items.map((i) => `<span>${i.productName} <strong style="color:var(--text-secondary);">(x${i.quantity})</strong></span>`).join(', ')}
-                            </div>
-                            ${sale.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${sale.notes}"</div>` : ''}
-                          </td>
-                          <td class="table-amount ${isPaid ? 'text-emerald' : 'text-rose'}">
-                            ${formatCurrency(sale.totalAmount, currency)}
-                          </td>
-                          <td>
-                            ${badgeHtml}
-                          </td>
-                          <td style="font-size:var(--text-xs); color:var(--text-secondary);">
-                            ${sale.paymentMethod}
-                          </td>
-                          <td style="text-align:right; white-space:nowrap;">
-                            ${
-                              !isPaid
-                                ? `
-                              <button
-                                type="button"
-                                class="btn btn-sm btn-whatsapp-action btn-send-debt-wa"
-                                data-sale-id="${sale.id}"
-                                title="Send pre-formatted WhatsApp debt notice detailing items and due balance"
-                                style="margin-right:6px;"
-                              >
-                                💬 WhatsApp Notice
-                              </button>
-                            `
-                                : ''
-                            }
-                            <button
-                              class="btn btn-sm ${isPaid ? 'btn-secondary' : 'btn-success'} btn-toggle-status"
-                              data-sale-id="${sale.id}"
-                              title="${isPaid ? 'Revert to Pending Debt' : 'Mark Debt as Paid'}"
-                            >
-                              ${isPaid ? 'Revert' : '✓ Mark Paid'}
-                            </button>
-                            <button
-                              class="btn btn-outline-danger btn-sm btn-delete-sale"
-                              data-sale-id="${sale.id}"
-                              title="Delete record"
-                              style="margin-left:6px;"
-                            >
-                              🗑️
-                            </button>
-                          </td>
-                        </tr>
-                      `;
-                          })
-                          .join('')
-                  }
+                <tbody id="sales-table-body">
+                  ${this.renderSalesTableBodyHTML(sales, filtered, currency)}
                 </tbody>
               </table>
             </div>`
       }
     `;
+  }
+
+  private renderSalesTableBodyHTML(sales: Sale[], filteredInput?: Sale[], currencyInput?: string): string {
+    const currency = currencyInput || this.currentUser?.currency || '₦';
+    let filtered = filteredInput;
+    if (!filtered) {
+      filtered = sales;
+      if (this.salesStatusFilter === 'completed') {
+        filtered = filtered.filter((s) => s.status === 'completed');
+      } else if (this.salesStatusFilter === 'pending') {
+        filtered = filtered.filter((s) => s.status === 'pending');
+      } else if (this.salesStatusFilter === 'overdue') {
+        filtered = filtered.filter((s) => {
+          if (s.status !== 'pending') return false;
+          const dueInfo = getDebtDueStatus(s.dueDate);
+          return dueInfo.status === 'overdue' || dueInfo.status === 'due_today';
+        });
+      }
+
+      if (this.salesSearchQuery.trim()) {
+        const q = this.salesSearchQuery.toLowerCase();
+        filtered = filtered.filter(
+          (s) =>
+            s.customerName.toLowerCase().includes(q) ||
+            s.customerPhone?.toLowerCase().includes(q) ||
+            s.items.some((i) => i.productName.toLowerCase().includes(q)) ||
+            s.id.toLowerCase().includes(q)
+        );
+      }
+    }
+
+    if (filtered.length === 0) {
+      return `<tr><td colspan="7"><div class="empty-state" style="border:none; margin:16px auto;">
+          <p>No transactions match your search filter.</p>
+         </div></td></tr>`;
+    }
+
+    return filtered
+      .map((sale) => {
+        const isPaid = sale.status === 'completed';
+        const dueInfo = getDebtDueStatus(sale.dueDate);
+
+        let badgeHtml = '';
+        if (isPaid) {
+          badgeHtml = `<span class="badge badge-paid">✓ Paid</span>`;
+        } else if (dueInfo.status === 'overdue') {
+          badgeHtml = `
+            <div>
+              <span class="badge badge-overdue">⚠️ ${dueInfo.label}</span>
+              <div style="font-size:10px; color:#fb7185; margin-top:2px;">Due: ${sale.dueDate}</div>
+            </div>
+          `;
+        } else if (dueInfo.status === 'due_today') {
+          badgeHtml = `
+            <div>
+              <span class="badge badge-due-today">⏳ Due Today</span>
+              <div style="font-size:10px; color:#fbbf24; margin-top:2px;">Due: ${sale.dueDate}</div>
+            </div>
+          `;
+        } else if (dueInfo.status === 'upcoming') {
+          badgeHtml = `
+            <div>
+              <span class="badge badge-upcoming">📅 ${dueInfo.label}</span>
+              <div style="font-size:10px; color:var(--text-muted); margin-top:2px;">Due: ${sale.dueDate}</div>
+            </div>
+          `;
+        } else {
+          badgeHtml = `<span class="badge badge-pending">⏳ Pending Debt</span>`;
+        }
+
+        return `
+    <tr>
+      <td style="color:var(--text-secondary); font-size:var(--text-xs);">
+        ${formatDate(sale.createdAt)}
+      </td>
+      <td>
+        <div style="font-weight:700;">${sale.customerName}</div>
+        ${sale.customerPhone ? `<div style="font-size:var(--text-xs); color:var(--text-muted);">${sale.customerPhone}</div>` : ''}
+      </td>
+      <td>
+        <div style="font-size:var(--text-xs);">
+          ${sale.items.map((i) => `<span>${i.productName} <strong style="color:var(--text-secondary);">(x${i.quantity})</strong></span>`).join(', ')}
+        </div>
+        ${sale.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${sale.notes}"</div>` : ''}
+      </td>
+      <td class="table-amount ${isPaid ? 'text-emerald' : 'text-rose'}">
+        ${formatCurrency(sale.totalAmount, currency)}
+      </td>
+      <td>
+        ${badgeHtml}
+      </td>
+      <td style="font-size:var(--text-xs); color:var(--text-secondary);">
+        ${sale.paymentMethod}
+      </td>
+      <td style="text-align:right; white-space:nowrap;">
+        ${
+          !isPaid
+            ? `
+          <button
+            type="button"
+            class="btn btn-sm btn-whatsapp-action btn-send-debt-wa"
+            data-sale-id="${sale.id}"
+            title="Send pre-formatted WhatsApp debt notice detailing items and due balance"
+            style="margin-right:6px;"
+          >
+            💬 WhatsApp Notice
+          </button>
+        `
+            : ''
+        }
+        <button
+          class="btn btn-sm ${isPaid ? 'btn-secondary' : 'btn-success'} btn-toggle-status"
+          data-sale-id="${sale.id}"
+          title="${isPaid ? 'Revert to Pending Debt' : 'Mark Debt as Paid'}"
+        >
+          ${isPaid ? 'Revert' : '✓ Mark Paid'}
+        </button>
+        <button
+          class="btn btn-outline-danger btn-sm btn-delete-sale"
+          data-sale-id="${sale.id}"
+          title="Delete record"
+          style="margin-left:6px;"
+        >
+          🗑️
+        </button>
+      </td>
+    </tr>
+  `;
+      })
+      .join('');
   }
 
   // =========================================================================
@@ -1294,8 +1535,8 @@ class MultiPageApp {
               ${products
                 .map(
                   (p) => `
-                <option value="${p.id}" data-price="${p.price}" data-name="${p.name}" data-stock="${p.stock}" ${p.id === preselectedProductId ? 'selected' : ''}>
-                  ${p.name} (${formatCurrency(p.price, currency)}) — Stock: ${p.stock}
+                <option value="${p.id}" data-price="${p.price}" data-name="${escapeHtml(p.name)}" data-stock="${p.stock}" ${p.id === preselectedProductId ? 'selected' : ''}>
+                  ${escapeHtml(p.name)} (${formatCurrency(p.price, currency)}) — Stock: ${p.stock}
                 </option>
               `
                 )
@@ -1310,7 +1551,7 @@ class MultiPageApp {
               id="sale-custom-item-name"
               class="form-input"
               placeholder="e.g. Silk Ankara Kaftan"
-              value="${preselectedProd ? preselectedProd.name : ''}"
+              value="${preselectedProd ? escapeHtml(preselectedProd.name) : ''}"
               required
             />
           </div>
@@ -1462,7 +1703,7 @@ class MultiPageApp {
                 0
               );
               return `
-              <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-bottom:14px;">
+              <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap:10px; margin-bottom:14px;">
                 <div style="background:var(--bg-surface-elevated); padding:10px 14px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
                   <div style="font-size:11px; color:var(--text-muted);">Total Stock</div>
                   <div style="font-size:16px; font-weight:800; color:var(--text-primary);">${formatNumber(totalStockUnits)} units</div>
@@ -1489,11 +1730,11 @@ class MultiPageApp {
                     id="inventory-search-input"
                     class="search-input"
                     placeholder="Search product name or category..."
-                    value="${this.inventorySearchQuery}"
+                    value="${escapeHtml(this.inventorySearchQuery)}"
                   />
                 </div>
 
-                <select id="inventory-category-select" class="form-select" style="max-width:200px; padding:7px 10px; font-size:var(--text-xs);">
+                <select id="inventory-category-select" class="form-select inventory-cat-select">
                   <option value="all">All Categories (${products.length})</option>
                   ${categories
                     .map((c) => `<option value="${c}" ${this.inventoryCategoryFilter === c ? 'selected' : ''}>${c}</option>`)
@@ -1502,97 +1743,8 @@ class MultiPageApp {
               </div>
             </section>
 
-            <div class="product-grid">
-              ${
-                filtered.length === 0
-                  ? `<div class="empty-state" style="grid-column:1 / -1; border:none; padding:24px 16px;">
-                      <p style="margin-bottom:8px;">No products match your current search or category filter (${products.length} products total in catalog).</p>
-                      <button type="button" class="btn btn-secondary btn-sm" id="btn-reset-inventory-filters">
-                        🔄 Reset Filters & Show All Products
-                      </button>
-                     </div>`
-                  : filtered
-                      .map((product) => {
-                        let stockBadge = '';
-                        if (product.stock === 0) {
-                          stockBadge = `<span class="badge badge-out-of-stock">🚨 Out of Stock (0)</span>`;
-                        } else if (product.stock <= lowStockThreshold) {
-                          stockBadge = `<span class="badge badge-low-stock">⚠️ Low Stock: ${product.stock} left (≤${lowStockThreshold})</span>`;
-                        } else {
-                          stockBadge = `<span class="badge badge-in-stock">✓ ${product.stock} in stock</span>`;
-                        }
-
-                        const hasCost = product.costPrice !== undefined;
-                        const costPrice = product.costPrice ?? 0;
-                        const unitProfit = product.price - costPrice;
-                        const marginPct = product.price > 0 ? Math.round((unitProfit / product.price) * 100) : 0;
-
-                        return `
-                  <div class="product-card ${product.stock <= lowStockThreshold ? 'border-amber' : ''}">
-                    <div class="product-card-image-box">
-                      ${
-                        product.image
-                          ? `<img src="${product.image}" alt="${product.name}" class="product-card-img" />`
-                          : `<span class="product-card-img-placeholder">🏷️</span>`
-                      }
-                    </div>
-
-                    <div class="product-card-body">
-                      <div class="product-card-header">
-                        <div>
-                          <h3 class="product-card-title">${product.name}</h3>
-                          <span class="product-card-category">${product.category}</span>
-                        </div>
-                      </div>
-
-                      <div style="margin:4px 0;">
-                        ${stockBadge}
-                      </div>
-
-                      ${
-                        hasCost
-                          ? `<div class="product-card-profit-row">
-                              <span style="color:var(--text-secondary);">Cost: <strong style="color:var(--text-primary);">${formatCurrency(costPrice, currency)}</strong></span>
-                              <span class="${unitProfit >= 0 ? 'text-emerald' : 'text-rose'}" style="font-weight:700;">
-                                Est. Profit: ${unitProfit >= 0 ? '+' : ''}${formatCurrency(unitProfit, currency)} (${marginPct}%)
-                              </span>
-                            </div>`
-                          : `<div class="product-card-profit-row" style="color:var(--text-muted);">
-                              <span>Cost price not set</span>
-                              <a href="#/edit-product/${product.id}" style="color:var(--accent-emerald); font-weight:600; text-decoration:none;">+ Set cost</a>
-                            </div>`
-                      }
-
-                      <div class="product-card-price-row">
-                        <span class="product-card-price">${formatCurrency(product.price, currency)}</span>
-                        <button
-                          type="button"
-                          class="btn btn-secondary btn-sm btn-quick-restock"
-                          data-product-id="${product.id}"
-                          title="Instantly add +5 units to stock"
-                          style="font-size:11px; padding:3px 8px; min-height:24px;"
-                        >
-                          +5 Stock
-                        </button>
-                      </div>
-
-                      <div class="product-card-footer">
-                        <a href="#/new-sale?product=${product.id}" class="btn btn-secondary btn-sm" style="flex:1;">
-                          ⚡ Sell Item
-                        </a>
-                        <a href="#/edit-product/${product.id}" class="btn btn-secondary btn-sm" title="Edit product">
-                          ✏️
-                        </a>
-                        <button type="button" class="btn btn-outline-danger btn-sm btn-delete-product" data-product-id="${product.id}" title="Delete product">
-                          🗑️
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                `;
-                      })
-                      .join('')
-              }
+            <div class="product-grid" id="inventory-product-grid">
+              ${this.renderInventoryGridInnerHTML(products, filtered)}
             </div>`
       }
 
@@ -1619,15 +1771,123 @@ class MultiPageApp {
               ⚠️ This will remove the item from your digital catalog and storefront. Existing completed sales records remain preserved.
             </p>
           </div>
-          <div class="modal-actions" style="display:flex; justify-content:flex-end; gap:10px; margin-top:16px;">
+          <div class="modal-footer">
             <button type="button" class="btn btn-secondary btn-sm" id="btn-cancel-delete-prod">Cancel</button>
-            <button type="button" class="btn btn-danger btn-sm" id="btn-confirm-delete-prod">
+            <button type="button" class="btn btn-outline-danger btn-sm" id="btn-confirm-delete-prod">
               🗑️ Delete Product
             </button>
           </div>
         </div>
       </div>
     `;
+  }
+
+  private renderInventoryGridInnerHTML(products: Product[], filteredInput?: Product[]): string {
+    const currency = this.currentUser?.currency || '₦';
+    const lowStockThreshold = this.currentUser?.lowStockThreshold ?? 5;
+    let filtered = filteredInput;
+    if (!filtered) {
+      filtered = products;
+      if (this.inventoryCategoryFilter !== 'all') {
+        filtered = filtered.filter((p) => p.category === this.inventoryCategoryFilter);
+      }
+      if (this.inventorySearchQuery.trim()) {
+        const q = this.inventorySearchQuery.toLowerCase();
+        filtered = filtered.filter(
+          (p) => p.name.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)
+        );
+      }
+    }
+
+    if (filtered.length === 0) {
+      return `<div class="empty-state" style="grid-column:1 / -1; border:none; padding:24px 16px;">
+          <p style="margin-bottom:8px;">No products match your current search or category filter (${products.length} products total in catalog).</p>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-reset-inventory-filters">
+            🔄 Reset Filters & Show All Products
+          </button>
+         </div>`;
+    }
+
+    return filtered
+      .map((product) => {
+        let stockBadge = '';
+        if (product.stock === 0) {
+          stockBadge = `<span class="badge badge-out-of-stock">🚨 Out of Stock (0)</span>`;
+        } else if (product.stock <= lowStockThreshold) {
+          stockBadge = `<span class="badge badge-low-stock">⚠️ Low Stock: ${product.stock} left (≤${lowStockThreshold})</span>`;
+        } else {
+          stockBadge = `<span class="badge badge-in-stock">✓ ${product.stock} in stock</span>`;
+        }
+
+        const hasCost = product.costPrice !== undefined;
+        const costPrice = product.costPrice ?? 0;
+        const unitProfit = product.price - costPrice;
+        const marginPct = product.price > 0 ? Math.round((unitProfit / product.price) * 100) : 0;
+
+        return `
+  <div class="product-card ${product.stock <= lowStockThreshold ? 'border-amber' : ''}">
+    <div class="product-card-image-box">
+      ${
+        product.image
+          ? `<img src="${product.image}" alt="${product.name}" class="product-card-img" />`
+          : `<span class="product-card-img-placeholder">🏷️</span>`
+      }
+    </div>
+
+    <div class="product-card-body">
+      <div class="product-card-header">
+        <div>
+          <h3 class="product-card-title">${product.name}</h3>
+          <span class="product-card-category">${product.category}</span>
+        </div>
+      </div>
+
+      <div style="margin:4px 0;">
+        ${stockBadge}
+      </div>
+
+      ${
+        hasCost
+          ? `<div class="product-card-profit-row">
+              <span style="color:var(--text-secondary);">Cost: <strong style="color:var(--text-primary);">${formatCurrency(costPrice, currency)}</strong></span>
+              <span class="${unitProfit >= 0 ? 'text-emerald' : 'text-rose'}" style="font-weight:700;">
+                Est. Profit: ${unitProfit >= 0 ? '+' : ''}${formatCurrency(unitProfit, currency)} (${marginPct}%)
+              </span>
+            </div>`
+          : `<div class="product-card-profit-row" style="color:var(--text-muted);">
+              <span>Cost price not set</span>
+              <a href="#/edit-product/${product.id}" style="color:var(--accent-emerald); font-weight:600; text-decoration:none;">+ Set cost</a>
+            </div>`
+      }
+
+      <div class="product-card-price-row">
+        <span class="product-card-price">${formatCurrency(product.price, currency)}</span>
+        <button
+          type="button"
+          class="btn btn-secondary btn-sm btn-add-stock"
+          data-product-id="${product.id}"
+          title="Add restocked units & update price if changed"
+        >
+          Add Stock
+        </button>
+      </div>
+
+      <div class="product-card-footer">
+        <a href="#/new-sale?product=${product.id}" class="btn btn-secondary btn-sm" style="flex:1; min-width:0;">
+          ⚡ Sell
+        </a>
+        <a href="#/edit-product/${product.id}" class="btn btn-secondary btn-sm" title="Edit product">
+          ✏️
+        </a>
+        <button type="button" class="btn btn-outline-danger btn-sm btn-delete-product" data-product-id="${product.id}" title="Delete product">
+          🗑️
+        </button>
+      </div>
+    </div>
+  </div>
+`;
+      })
+      .join('');
   }
 
   // =========================================================================
@@ -1769,7 +2029,7 @@ class MultiPageApp {
 
           <div class="form-group">
             <label class="form-label" for="product-name">Product Name</label>
-            <input type="text" id="product-name" class="form-input" value="${product.name}" required />
+            <input type="text" id="product-name" class="form-input" value="${escapeHtml(product.name)}" required />
           </div>
 
           <div class="form-grid-2col">
@@ -1812,7 +2072,7 @@ class MultiPageApp {
             </div>
             <div class="form-group">
               <label class="form-label" for="product-category">Category</label>
-              <input type="text" id="product-category" class="form-input" value="${product.category}" list="category-suggestions" required />
+              <input type="text" id="product-category" class="form-input" value="${escapeHtml(product.category)}" list="category-suggestions" required />
               <datalist id="category-suggestions">
                 ${POPULAR_NICHES.map((n) => `<option value="${n}" />`).join('')}
               </datalist>
@@ -1971,10 +2231,8 @@ class MultiPageApp {
                   id="expenses-search-input"
                   class="search-input"
                   placeholder="Search expenses by item, vendor name, or note..."
-                  value="${this.expensesSearchQuery}"
+                  value="${escapeHtml(this.expensesSearchQuery)}"
                 />
-              </div>
-
               </div>
             </div>
           </section>
@@ -2046,71 +2304,96 @@ class MultiPageApp {
                   <th style="text-align:right;">Actions</th>
                 </tr>
               </thead>
-              <tbody>
-                ${
-                  filtered.length === 0
-                    ? `<tr><td colspan="7"><div class="empty-state" style="border:none; margin:16px auto;">
-                        <p>No expense records match your search filter.</p>
-                       </div></td></tr>`
-                    : filtered
-                        .map((exp) => {
-                          const dateStr = new Date(exp.date || exp.createdAt).toLocaleDateString('en-US', {
-                            month: 'short',
-                            day: 'numeric',
-                            year: 'numeric',
-                          });
-
-                          return `
-                      <tr>
-                        <td style="color:var(--text-secondary); font-size:var(--text-xs); white-space:nowrap;">
-                          ${dateStr}
-                        </td>
-                        <td>
-                          <div style="font-weight:700; color:var(--text-primary);">${exp.title}</div>
-                          ${exp.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${exp.notes}"</div>` : ''}
-                        </td>
-                        <td>
-                          <span class="expense-category-tag">
-                            🏷️ ${exp.category}
-                          </span>
-                        </td>
-                        <td style="font-size:var(--text-xs); color:var(--text-secondary);">
-                          ${exp.vendor || '—'}
-                        </td>
-                        <td style="font-size:var(--text-xs); color:var(--text-secondary);">
-                          ${exp.paymentMethod || 'Cash'}
-                        </td>
-                        <td class="table-amount" style="color:#fb923c; text-align:right;">
-                          ${formatCurrency(exp.amount, currency)}
-                        </td>
-                        <td style="text-align:right; white-space:nowrap;">
-                          <a
-                            href="#/edit-expense/${exp.id}"
-                            class="btn btn-secondary btn-sm"
-                            title="Edit expense"
-                          >
-                            ✏️ Edit
-                          </a>
-                          <button
-                            class="btn btn-outline-danger btn-sm btn-delete-expense"
-                            data-expense-id="${exp.id}"
-                            title="Delete expense"
-                            style="margin-left:6px;"
-                          >
-                            🗑️
-                          </button>
-                        </td>
-                      </tr>
-                    `;
-                        })
-                        .join('')
-                }
+              <tbody id="expenses-table-body">
+                ${this.renderExpensesTableBodyHTML(filtered, currency)}
               </tbody>
             </table>
           </div>
           `
       }
     `;
+  }
+
+  private renderExpensesTableBodyHTML(filteredInput?: Expense[], currencyInput?: string): string {
+    const currency = currencyInput || this.currentUser?.currency || '₦';
+    let filtered = filteredInput;
+    if (!filtered && this.currentUser) {
+      let expenses = StorageService.getExpenses(this.currentUser.id);
+      if (this.expensesCategoryFilter !== 'all') {
+        expenses = expenses.filter((e) => e.category === this.expensesCategoryFilter);
+      }
+      if (this.expensesSearchQuery.trim()) {
+        const q = this.expensesSearchQuery.toLowerCase();
+        expenses = expenses.filter(
+          (e) =>
+            e.title.toLowerCase().includes(q) ||
+            e.category.toLowerCase().includes(q) ||
+            (e.vendor || '').toLowerCase().includes(q) ||
+            (e.notes || '').toLowerCase().includes(q)
+        );
+      }
+      filtered = expenses;
+    }
+
+    const list = filtered || [];
+    if (list.length === 0) {
+      return `<tr><td colspan="7"><div class="empty-state" style="border:none; margin:16px auto;">
+          <p>No expense records match your search filter.</p>
+         </div></td></tr>`;
+    }
+
+    return list
+      .map((exp) => {
+        const dateStr = new Date(exp.date || exp.createdAt).toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        });
+
+        return `
+    <tr>
+      <td style="color:var(--text-secondary); font-size:var(--text-xs); white-space:nowrap;">
+        ${dateStr}
+      </td>
+      <td>
+        <div style="font-weight:700; color:var(--text-primary);">${exp.title}</div>
+        ${exp.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${exp.notes}"</div>` : ''}
+      </td>
+      <td>
+        <span class="expense-category-tag">
+          🏷️ ${exp.category}
+        </span>
+      </td>
+      <td style="font-size:var(--text-xs); color:var(--text-secondary);">
+        ${exp.vendor || '—'}
+      </td>
+      <td style="font-size:var(--text-xs); color:var(--text-secondary);">
+        ${exp.paymentMethod || 'Cash'}
+      </td>
+      <td class="table-amount" style="color:#fb923c; text-align:right;">
+        ${formatCurrency(exp.amount, currency)}
+      </td>
+      <td style="text-align:right; white-space:nowrap;">
+        <a
+          href="#/edit-expense/${exp.id}"
+          class="btn btn-secondary btn-sm"
+          title="Edit expense"
+        >
+          ✏️ Edit
+        </a>
+        <button
+          class="btn btn-outline-danger btn-sm btn-delete-expense"
+          data-expense-id="${exp.id}"
+          title="Delete expense"
+          style="margin-left:6px;"
+        >
+          🗑️
+        </button>
+      </td>
+    </tr>
+  `;
+      })
+      .join('');
   }
 
   // =========================================================================
@@ -2256,7 +2539,7 @@ class MultiPageApp {
               type="text"
               id="edit-expense-title"
               class="form-input"
-              value="${expense.title}"
+              value="${escapeHtml(expense.title)}"
               required
             />
           </div>
@@ -2313,7 +2596,7 @@ class MultiPageApp {
               type="text"
               id="edit-expense-vendor"
               class="form-input"
-              value="${expense.vendor || ''}"
+              value="${escapeHtml(expense.vendor || '')}"
             />
           </div>
 
@@ -2323,7 +2606,7 @@ class MultiPageApp {
               id="edit-expense-notes"
               class="form-textarea"
               rows="2"
-            >${expense.notes || ''}</textarea>
+            >${escapeHtml(expense.notes || '')}</textarea>
           </div>
 
           <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:8px;">
@@ -2682,7 +2965,7 @@ class MultiPageApp {
         <form id="form-settings-page" style="display:flex; flex-direction:column; gap:16px;">
           <div class="form-group">
             <label class="form-label" for="settings-name">Your Full Name</label>
-            <input type="text" id="settings-name" class="form-input" value="${this.currentUser?.name || ''}" required />
+            <input type="text" id="settings-name" class="form-input" value="${escapeHtml(this.currentUser?.name || '')}" required />
           </div>
 
           <div class="form-group">
@@ -2696,7 +2979,7 @@ class MultiPageApp {
           <div id="settings-merchant-fields" style="display:${isMerchant ? 'flex' : 'none'}; flex-direction:column; gap:16px;">
             <div class="form-group">
               <label class="form-label" for="settings-store-name">Business / Store Name</label>
-              <input type="text" id="settings-store-name" class="form-input" value="${this.currentUser?.storeName || ''}" />
+              <input type="text" id="settings-store-name" class="form-input" value="${escapeHtml(this.currentUser?.storeName || '')}" />
             </div>
 
             <div class="form-group">
@@ -2708,18 +2991,18 @@ class MultiPageApp {
 
             <div class="form-group">
               <label class="form-label" for="settings-city">Location / City</label>
-              <input type="text" id="settings-city" class="form-input" value="${this.currentUser?.city || ''}" placeholder="e.g. Lagos, Abuja, Accra, Nairobi" />
+              <input type="text" id="settings-city" class="form-input" value="${escapeHtml(this.currentUser?.city || '')}" placeholder="e.g. Lagos, Abuja, Accra, Nairobi" />
             </div>
 
             <div class="form-group">
               <label class="form-label" for="settings-bio">Store Bio / Description</label>
-              <textarea id="settings-bio" class="form-textarea" rows="2" placeholder="Briefly describe what you sell for buyers in Explore...">${this.currentUser?.bio || ''}</textarea>
+              <textarea id="settings-bio" class="form-textarea" rows="2" placeholder="Briefly describe what you sell for buyers in Explore...">${escapeHtml(this.currentUser?.bio || '')}</textarea>
             </div>
           </div>
 
           <div class="form-group">
             <label class="form-label" for="settings-phone">WhatsApp Contact Phone Number</label>
-            <input type="tel" id="settings-phone" class="form-input" value="${this.currentUser?.phone || ''}" placeholder="e.g. 08023456789 or 2348012345678" required />
+            <input type="tel" id="settings-phone" class="form-input" value="${escapeHtml(this.currentUser?.phone || '')}" placeholder="e.g. 08023456789 or 2348012345678" required />
             <span class="form-hint">Direct link for buyer inquiries or merchant orders via WhatsApp wa.me</span>
           </div>
 
@@ -2794,6 +3077,22 @@ class MultiPageApp {
           `
               : ''
           }
+
+          <div class="form-group" style="border-top:1px solid var(--border-subtle); padding-top:16px;">
+            <label class="form-label" for="settings-new-password">🔒 ${this.currentUser?.passwordHash ? 'Change Account Password (Optional)' : 'Set Account Password (Optional)'}</label>
+            <div class="password-input-wrapper">
+              <input
+                type="password"
+                id="settings-new-password"
+                class="form-input"
+                minlength="4"
+                autocomplete="new-password"
+                placeholder="${this.currentUser?.passwordHash ? 'Leave blank to keep current password' : 'Set a password (min. 4 characters)'}"
+              />
+              <button type="button" class="btn-toggle-password" data-target="settings-new-password" aria-label="Toggle password visibility">Show</button>
+            </div>
+            <span class="form-hint">Minimum 4 characters. Protects logins and account switching on this device.</span>
+          </div>
 
           <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:8px;">
             <button type="submit" class="btn btn-primary">Save Profile Settings</button>
@@ -3051,7 +3350,7 @@ class MultiPageApp {
                     id="buyer-search-input"
                     class="search-input"
                     placeholder="Search seller, product, or note..."
-                    value="${this.buyerSearchQuery}"
+                    value="${escapeHtml(this.buyerSearchQuery)}"
                   />
                 </div>
               </div>
@@ -3110,72 +3409,8 @@ class MultiPageApp {
                     <th style="text-align:right;">Actions</th>
                   </tr>
                 </thead>
-                <tbody>
-                  ${
-                    filtered.length === 0
-                      ? `<tr><td colspan="6"><div class="empty-state" style="border:none; margin:16px auto;"><p>No records match your filter.</p></div></td></tr>`
-                      : filtered
-                          .map((p) => {
-                            const isPaid = p.status === 'completed';
-                            const merchantName = p.merchantStoreName || 'Marketplace Merchant';
-                            const waPhone = sanitizeWhatsAppPhone(p.merchantPhone || '');
-                            const waMessage = encodeURIComponent(
-                              `Hello ${merchantName}! 👋\nI am contacting you from ShopKepa regarding my order (${p.items.map((i) => i.productName).join(', ')}) of ${formatCurrency(p.totalAmount, currency)}.`
-                            );
-                            const waLink = waPhone ? `https://wa.me/${waPhone}?text=${waMessage}` : '';
-
-                            return `
-                              <tr>
-                                <td style="color:var(--text-secondary); font-size:var(--text-xs);">
-                                  ${formatDate(p.createdAt)}
-                                </td>
-                                <td>
-                                  <div style="font-weight:700;">${merchantName}</div>
-                                  ${p.merchantPhone ? `<div style="font-size:var(--text-xs); color:var(--text-muted);">${p.merchantPhone}</div>` : ''}
-                                </td>
-                                <td>
-                                  <div style="font-size:var(--text-xs);">
-                                    ${p.items.map((i) => `<span>${i.productName} <strong style="color:var(--text-secondary);">(x${i.quantity})</strong></span>`).join(', ')}
-                                  </div>
-                                  ${p.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${p.notes}"</div>` : ''}
-                                </td>
-                                <td class="table-amount ${isPaid ? 'text-emerald' : 'text-rose'}">
-                                  ${formatCurrency(p.totalAmount, currency)}
-                                </td>
-                                <td>
-                                  <span class="badge ${isPaid ? 'badge-paid' : 'badge-owing'}">
-                                    ${isPaid ? '✓ Paid' : `⏳ Owing ${formatCurrency(p.totalAmount, currency)}`}
-                                  </span>
-                                </td>
-                                <td style="text-align:right; white-space:nowrap;">
-                                  ${
-                                    !isPaid && waLink
-                                      ? `<a href="${waLink}" target="_blank" rel="noopener noreferrer" class="btn btn-whatsapp btn-sm" style="text-decoration:none; margin-right:6px;" title="Chat with seller on WhatsApp to pay debt">
-                                          💬 Message Seller on WhatsApp
-                                         </a>`
-                                      : ''
-                                  }
-                                  <button
-                                    class="btn btn-sm ${isPaid ? 'btn-secondary' : 'btn-success'} btn-toggle-buyer-status"
-                                    data-purchase-id="${p.id}"
-                                    title="${isPaid ? 'Revert to Owing Debt' : 'Mark Debt as Settled / Paid'}"
-                                  >
-                                    ${isPaid ? 'Revert' : '✓ Mark Paid'}
-                                  </button>
-                                  <button
-                                    class="btn btn-outline-danger btn-sm btn-delete-buyer-record"
-                                    data-purchase-id="${p.id}"
-                                    title="Delete record"
-                                    style="margin-left:6px;"
-                                  >
-                                    🗑️
-                                  </button>
-                                </td>
-                              </tr>
-                            `;
-                          })
-                          .join('')
-                  }
+                <tbody id="buyer-table-body">
+                  ${this.renderBuyerTableBodyHTML(filtered, currency)}
                 </tbody>
               </table>
             </div>
@@ -3201,7 +3436,7 @@ class MultiPageApp {
                 <input type="tel" id="buyer-merchant-phone" class="form-input" placeholder="e.g. 08012345678" />
               </div>
 
-              <div style="display:grid; grid-template-columns: 2fr 1fr; gap:10px;">
+              <div class="form-grid-2-1">
                 <div class="form-group">
                   <label class="form-label" for="buyer-item-name">Product / Item Name</label>
                   <input type="text" id="buyer-item-name" class="form-input" placeholder="e.g. Organic Serum" required />
@@ -3219,7 +3454,7 @@ class MultiPageApp {
 
               <div class="form-group">
                 <label class="form-label">Payment Status</label>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                <div class="form-grid-2col">
                   <label style="background:var(--bg-surface-elevated); padding:10px; border-radius:var(--radius-md); border:1px solid var(--border-subtle); display:flex; align-items:center; gap:8px; cursor:pointer;">
                     <input type="radio" name="buyer-status" value="completed" checked />
                     <span style="font-size:var(--text-xs); font-weight:700; color:var(--accent-emerald);">✓ Fully Paid</span>
@@ -3244,6 +3479,502 @@ class MultiPageApp {
         </div>
       </div>
     `;
+  }
+
+  private renderBuyerTableBodyHTML(filteredInput?: Sale[], currencyInput?: string): string {
+    const currency = currencyInput || this.currentUser?.currency || '₦';
+    let filtered = filteredInput;
+    if (!filtered && this.currentUser) {
+      let allPurchases = StorageService.getBuyerPurchases(this.currentUser);
+      if (this.buyerStatusFilter !== 'all') {
+        allPurchases = allPurchases.filter((p) => p.status === this.buyerStatusFilter);
+      }
+      if (this.buyerSearchQuery.trim()) {
+        const q = this.buyerSearchQuery.toLowerCase();
+        allPurchases = allPurchases.filter(
+          (p) =>
+            p.merchantStoreName?.toLowerCase().includes(q) ||
+            p.customerName.toLowerCase().includes(q) ||
+            p.items.some((i) => i.productName.toLowerCase().includes(q)) ||
+            p.notes?.toLowerCase().includes(q)
+        );
+      }
+      filtered = allPurchases;
+    }
+
+    const list = filtered || [];
+    if (list.length === 0) {
+      return `<tr><td colspan="6"><div class="empty-state" style="border:none; margin:16px auto;"><p>No records match your filter.</p></div></td></tr>`;
+    }
+
+    return list
+      .map((p) => {
+        const isPaid = p.status === 'completed';
+        const merchantName = p.merchantStoreName || 'Marketplace Merchant';
+        const waPhone = sanitizeWhatsAppPhone(p.merchantPhone || '');
+        const waMessage = encodeURIComponent(
+          `Hello ${merchantName}! 👋\nI am contacting you from ShopKepa regarding my order (${p.items.map((i) => i.productName).join(', ')}) of ${formatCurrency(p.totalAmount, currency)}.`
+        );
+        const waLink = waPhone ? `https://wa.me/${waPhone}?text=${waMessage}` : '';
+
+        return `
+          <tr>
+            <td style="color:var(--text-secondary); font-size:var(--text-xs);">
+              ${formatDate(p.createdAt)}
+            </td>
+            <td>
+              <div style="font-weight:700;">${merchantName}</div>
+              ${p.merchantPhone ? `<div style="font-size:var(--text-xs); color:var(--text-muted);">${p.merchantPhone}</div>` : ''}
+            </td>
+            <td>
+              <div style="font-size:var(--text-xs);">
+                ${p.items.map((i) => `<span>${i.productName} <strong style="color:var(--text-secondary);">(x${i.quantity})</strong></span>`).join(', ')}
+              </div>
+              ${p.notes ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:2px; font-style:italic;">"${p.notes}"</div>` : ''}
+            </td>
+            <td class="table-amount ${isPaid ? 'text-emerald' : 'text-rose'}">
+              ${formatCurrency(p.totalAmount, currency)}
+            </td>
+            <td>
+              <span class="badge ${isPaid ? 'badge-paid' : 'badge-owing'}">
+                ${isPaid ? '✓ Paid' : `⏳ Owing ${formatCurrency(p.totalAmount, currency)}`}
+              </span>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              ${
+                !isPaid && waLink
+                  ? `<a href="${waLink}" target="_blank" rel="noopener noreferrer" class="btn btn-whatsapp btn-sm" style="text-decoration:none; margin-right:6px;" title="Chat with seller on WhatsApp to pay debt">
+                      💬 Message Seller on WhatsApp
+                     </a>`
+                  : ''
+              }
+              <button
+                class="btn btn-sm ${isPaid ? 'btn-secondary' : 'btn-success'} btn-toggle-buyer-status"
+                data-purchase-id="${p.id}"
+                title="${isPaid ? 'Revert to Owing Debt' : 'Mark Debt as Settled / Paid'}"
+              >
+                ${isPaid ? 'Revert' : '✓ Mark Paid'}
+              </button>
+              <button
+                class="btn btn-outline-danger btn-sm btn-delete-buyer-record"
+                data-purchase-id="${p.id}"
+                title="Delete record"
+                style="margin-left:6px;"
+              >
+                🗑️
+              </button>
+            </td>
+          </tr>
+        `;
+      })
+      .join('');
+  }
+
+  // =========================================================================
+  // ADD STOCK / RESTOCK MODAL (WITH FLEXIBLE PRICE CHANGE PROMPT)
+  // =========================================================================
+  private openAddStockModal(productId: string): void {
+    const product = StorageService.getProduct(productId);
+    if (!product) return;
+    const currency = this.currentUser?.currency || '₦';
+
+    let modal = document.getElementById('modal-add-stock');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'modal-add-stock';
+      modal.className = 'modal-overlay';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      document.body.appendChild(modal);
+    }
+
+    const closeModal = () => {
+      modal?.classList.remove('open');
+    };
+
+    const currentCostStr = product.costPrice !== undefined ? formatCurrency(product.costPrice, currency) : 'Not set';
+
+    modal.innerHTML = `
+      <div class="modal-card" style="max-width:460px;">
+        <div class="modal-header">
+          <h2 class="modal-title" style="display:flex; align-items:center; gap:8px;">
+            <span>📦</span> Add Stock
+          </h2>
+          <button type="button" class="modal-close-btn" id="btn-close-add-stock-modal" aria-label="Close modal">&times;</button>
+        </div>
+
+        <form id="form-add-stock-modal">
+          <div class="modal-body" style="gap:14px;">
+            <div style="background:var(--bg-surface-elevated); padding:12px 14px; border-radius:var(--radius-md); border:1px solid var(--border-subtle);">
+              <div style="font-size:var(--text-sm); font-weight:700; color:var(--text-primary); margin-bottom:4px;">
+                ${product.name}
+              </div>
+              <div style="font-size:var(--text-xs); color:var(--text-secondary); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+                <span>${product.category || 'General'}</span>
+                <span>Current Stock: <strong style="color:var(--text-primary);">${product.stock} units</strong></span>
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-top:6px; padding-top:6px; border-top:1px solid var(--border-subtle);">
+                <span>Current Cost: <strong style="color:var(--text-secondary);">${currentCostStr}</strong></span>
+                <span>Current Selling Price: <strong style="color:var(--accent-emerald);">${formatCurrency(product.price, currency)}</strong></span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="add-stock-qty-input">Quantity Restocked (Units to Add)</label>
+              <input
+                type="number"
+                id="add-stock-qty-input"
+                class="form-input"
+                min="1"
+                step="1"
+                placeholder="Enter number of units added (e.g. 12)"
+                required
+              />
+              <span class="form-hint" id="add-stock-preview-hint">
+                Enter how many new units you restocked to add to your current ${product.stock} units.
+              </span>
+            </div>
+
+            <!-- Ask merchant if restock price changed -->
+            <div class="form-group">
+              <label class="form-label">Did the price change with this restock?</label>
+              <div class="form-grid-2col">
+                <label class="role-card-option active" id="opt-keep-price" style="padding:10px 12px; gap:2px; border-width:1px;">
+                  <div style="display:flex; align-items:center; gap:6px; font-size:var(--text-xs); font-weight:700;">
+                    <input type="radio" name="restock-price-changed" value="no" checked />
+                    <span>No, keep current price</span>
+                  </div>
+                </label>
+                <label class="role-card-option" id="opt-change-price" style="padding:10px 12px; gap:2px; border-width:1px;">
+                  <div style="display:flex; align-items:center; gap:6px; font-size:var(--text-xs); font-weight:700;">
+                    <input type="radio" name="restock-price-changed" value="yes" />
+                    <span>Yes, update price</span>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div id="add-stock-price-fields" style="display:none; flex-direction:column; gap:12px; background:var(--bg-surface-elevated); padding:12px; border-radius:var(--radius-md); border:1px solid var(--border-strong);">
+              <div class="form-grid-2col">
+                <div class="form-group">
+                  <label class="form-label" for="add-stock-cost-price">New Cost Price (${currency})</label>
+                  <input
+                    type="text"
+                    id="add-stock-cost-price"
+                    class="form-input"
+                    placeholder="0.00"
+                    value="${product.costPrice !== undefined ? product.costPrice.toFixed(2) : ''}"
+                  />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="add-stock-sell-price">New Selling Price (${currency})</label>
+                  <input
+                    type="text"
+                    id="add-stock-sell-price"
+                    class="form-input"
+                    placeholder="0.00"
+                    value="${product.price.toFixed(2)}"
+                  />
+                </div>
+              </div>
+              <div id="add-stock-profit-hint" style="font-size:11px; color:var(--text-secondary);"></div>
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-cancel-add-stock">Cancel</button>
+            <button type="submit" class="btn btn-primary btn-sm">Save Restock</button>
+          </div>
+        </form>
+      </div>
+    `;
+
+    modal.classList.add('open');
+
+    const qtyInput = document.getElementById('add-stock-qty-input') as HTMLInputElement | null;
+    const previewHint = document.getElementById('add-stock-preview-hint');
+    const priceFieldsBox = document.getElementById('add-stock-price-fields');
+    const costInput = document.getElementById('add-stock-cost-price') as HTMLInputElement | null;
+    const sellInput = document.getElementById('add-stock-sell-price') as HTMLInputElement | null;
+    const profitHint = document.getElementById('add-stock-profit-hint');
+    const optKeep = document.getElementById('opt-keep-price');
+    const optChange = document.getElementById('opt-change-price');
+
+    const updateProfitPreview = () => {
+      if (!profitHint || !sellInput || !costInput) return;
+      const sellVal = parseSanitizedNumber(sellInput.value);
+      const costRaw = costInput.value.trim();
+      if (!costRaw) {
+        profitHint.innerHTML = `New selling price: <strong style="color:var(--accent-emerald);">${formatCurrency(sellVal, currency)}</strong> (enter cost price to estimate profit)`;
+        return;
+      }
+      const costVal = parseSanitizedNumber(costRaw);
+      const profit = sellVal - costVal;
+      const margin = sellVal > 0 ? Math.round((profit / sellVal) * 100) : 0;
+      profitHint.innerHTML = `Updated Est. Profit: <strong style="color:${profit >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)'};">${profit >= 0 ? '+' : ''}${formatCurrency(profit, currency)}/unit (${margin}% margin)</strong>`;
+    };
+
+    if (costInput) attachNumberSanitizer(costInput, updateProfitPreview);
+    if (sellInput) attachNumberSanitizer(sellInput, updateProfitPreview);
+    updateProfitPreview();
+
+    modal.querySelectorAll('input[name="restock-price-changed"]').forEach((radio) => {
+      radio.addEventListener('change', (e) => {
+        const val = (e.target as HTMLInputElement).value;
+        const isChanging = val === 'yes';
+        if (priceFieldsBox) priceFieldsBox.style.display = isChanging ? 'flex' : 'none';
+        optKeep?.classList.toggle('active', !isChanging);
+        optChange?.classList.toggle('active', isChanging);
+        if (isChanging) {
+          updateProfitPreview();
+          setTimeout(() => sellInput?.focus(), 30);
+        }
+      });
+    });
+
+    setTimeout(() => qtyInput?.focus(), 40);
+
+    qtyInput?.addEventListener('input', () => {
+      const added = parseInt(qtyInput.value, 10);
+      if (!previewHint) return;
+      if (!isNaN(added) && added > 0) {
+        previewHint.innerHTML = `New Total Stock: <strong style="color:var(--accent-emerald);">${product.stock} + ${added} = ${product.stock + added} units</strong>`;
+      } else {
+        previewHint.textContent = `Enter how many new units you restocked to add to your current ${product.stock} units.`;
+      }
+    });
+
+    document.getElementById('btn-close-add-stock-modal')?.addEventListener('click', closeModal);
+    document.getElementById('btn-cancel-add-stock')?.addEventListener('click', closeModal);
+    modal.onclick = (e) => {
+      if (e.target === modal) closeModal();
+    };
+
+    document.getElementById('form-add-stock-modal')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const added = parseInt(qtyInput?.value || '0', 10);
+      if (isNaN(added) || added <= 0) {
+        this.showToast('Please enter at least 1 unit to add.', 'warning');
+        return;
+      }
+
+      const freshProd = StorageService.getProduct(productId);
+      if (!freshProd) {
+        closeModal();
+        return;
+      }
+
+      const isPriceChanging =
+        (modal?.querySelector('input[name="restock-price-changed"]:checked') as HTMLInputElement | null)?.value === 'yes';
+
+      let nextPrice = freshProd.price;
+      let nextCostPrice = freshProd.costPrice;
+
+      if (isPriceChanging) {
+        const parsedSell = parseSanitizedNumber(sellInput?.value || '0');
+        if (parsedSell <= 0) {
+          this.showToast('Please enter a valid selling price greater than 0.', 'danger');
+          return;
+        }
+        nextPrice = parsedSell;
+        const rawCost = costInput?.value.trim() || '';
+        nextCostPrice = rawCost !== '' ? parseSanitizedNumber(rawCost) : undefined;
+      }
+
+      const updated = StorageService.saveProduct({
+        ...freshProd,
+        stock: freshProd.stock + added,
+        price: nextPrice,
+        costPrice: nextCostPrice,
+      });
+
+      closeModal();
+      const priceNote = isPriceChanging ? ` Price updated to ${formatCurrency(updated.price, currency)}.` : '';
+      this.showToast(`Added +${added} units to ${updated.name} (Now ${updated.stock} in stock).${priceNote}`, 'success');
+      this.render();
+    });
+  }
+
+  // =========================================================================
+  // REUSABLE IN-APP CONFIRMATION MODAL FOR VITAL & DESTRUCTIVE ACTIONS
+  // =========================================================================
+  private openConfirmActionModal(options: {
+    title: string;
+    message: string;
+    detailHtml?: string;
+    warning?: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  }): void {
+    let modal = document.getElementById('modal-confirm-vital-action');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'modal-confirm-vital-action';
+      modal.className = 'modal-overlay';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      document.body.appendChild(modal);
+    }
+
+    const closeModal = () => {
+      modal?.classList.remove('open');
+    };
+
+    const isDanger = options.danger !== false;
+
+    modal.innerHTML = `
+      <div class="modal-card" style="max-width:440px; border-color:${isDanger ? 'var(--accent-rose)' : 'var(--border-focus)'};">
+        <div class="modal-header">
+          <h2 class="modal-title" style="color:${isDanger ? 'var(--accent-rose)' : 'var(--text-primary)'}; display:flex; align-items:center; gap:8px;">
+            <span>${isDanger ? '⚠️' : 'ℹ️'}</span> ${options.title}
+          </h2>
+          <button type="button" class="modal-close-btn" id="btn-close-confirm-vital" aria-label="Close modal">&times;</button>
+        </div>
+        <div class="modal-body" style="gap:12px;">
+          <p style="font-size:var(--text-sm); color:var(--text-primary); font-weight:600; margin:0; line-height:1.45;">
+            ${options.message}
+          </p>
+          ${
+            options.detailHtml
+              ? `<div style="background:var(--bg-surface-elevated); padding:12px 14px; border-radius:var(--radius-md); font-size:var(--text-xs); color:var(--text-secondary); line-height:1.55; border:1px solid var(--border-subtle);">
+                  ${options.detailHtml}
+                 </div>`
+              : ''
+          }
+          ${
+            options.warning
+              ? `<p style="font-size:var(--text-xs); color:${isDanger ? 'var(--accent-rose)' : 'var(--accent-amber)'}; margin:0; font-weight:600;">
+                  ${options.warning}
+                 </p>`
+              : ''
+          }
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-cancel-confirm-vital">Cancel</button>
+          <button type="button" class="btn ${isDanger ? 'btn-outline-danger' : 'btn-primary'} btn-sm" id="btn-proceed-confirm-vital">
+            ${options.confirmLabel}
+          </button>
+        </div>
+      </div>
+    `;
+
+    modal.classList.add('open');
+
+    document.getElementById('btn-close-confirm-vital')?.addEventListener('click', closeModal);
+    document.getElementById('btn-cancel-confirm-vital')?.addEventListener('click', closeModal);
+    modal.onclick = (e) => {
+      if (e.target === modal) closeModal();
+    };
+
+    document.getElementById('btn-proceed-confirm-vital')?.addEventListener('click', () => {
+      closeModal();
+      options.onConfirm();
+    });
+  }
+
+  private bindPasswordToggles(root: ParentNode = document): void {
+    root.querySelectorAll<HTMLButtonElement>('.btn-toggle-password').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const targetId = btn.dataset.target;
+        if (!targetId) return;
+        const input = document.getElementById(targetId) as HTMLInputElement | null;
+        if (!input) return;
+        const isPassword = input.type === 'password';
+        input.type = isPassword ? 'text' : 'password';
+        btn.textContent = isPassword ? 'Hide' : 'Show';
+      });
+    });
+  }
+
+  private openSwitchAccountPasswordModal(targetUser: User): void {
+    let modal = document.getElementById('modal-switch-account-password');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'modal-switch-account-password';
+      modal.className = 'modal-overlay';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      document.body.appendChild(modal);
+    }
+
+    const closeModal = () => {
+      modal?.classList.remove('open');
+    };
+
+    const label = escapeHtml(targetUser.storeName || targetUser.name);
+
+    modal.innerHTML = `
+      <div class="modal-card" style="max-width:400px;">
+        <div class="modal-header">
+          <h2 class="modal-title" style="display:flex; align-items:center; gap:8px;">
+            <span>🔒</span> Verify Account Password
+          </h2>
+          <button type="button" class="modal-close-btn" id="btn-close-switch-pw" aria-label="Close modal">&times;</button>
+        </div>
+        <form id="form-switch-account-pw">
+          <div class="modal-body" style="gap:12px;">
+            <p style="font-size:var(--text-sm); color:var(--text-secondary); margin:0; line-height:1.45;">
+              Enter the password for <strong style="color:var(--text-primary);">${label}</strong> to switch accounts.
+            </p>
+            <div class="form-group">
+              <label class="form-label" for="switch-account-password">Password</label>
+              <div class="password-input-wrapper">
+                <input
+                  type="password"
+                  id="switch-account-password"
+                  class="form-input"
+                  placeholder="Enter account password"
+                  autocomplete="current-password"
+                  required
+                />
+                <button type="button" class="btn-toggle-password" data-target="switch-account-password" aria-label="Toggle password visibility">Show</button>
+              </div>
+            </div>
+            <div id="switch-pw-error" class="auth-error-msg" role="alert"></div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-cancel-switch-pw">Cancel</button>
+            <button type="submit" class="btn btn-primary btn-sm">Verify & Switch</button>
+          </div>
+        </form>
+      </div>
+    `;
+
+    modal.classList.add('open');
+    this.bindPasswordToggles(modal);
+
+    const pwInput = document.getElementById('switch-account-password') as HTMLInputElement | null;
+    const errBox = document.getElementById('switch-pw-error');
+    setTimeout(() => pwInput?.focus(), 40);
+
+    document.getElementById('btn-close-switch-pw')?.addEventListener('click', closeModal);
+    document.getElementById('btn-cancel-switch-pw')?.addEventListener('click', closeModal);
+    modal.onclick = (e) => {
+      if (e.target === modal) closeModal();
+    };
+
+    document.getElementById('form-switch-account-pw')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const entered = pwInput?.value || '';
+      const valid = await StorageService.verifyUserPassword(targetUser.id, entered);
+      if (!valid) {
+        if (errBox) {
+          errBox.textContent = 'Incorrect password. Please try again.';
+          errBox.classList.add('visible');
+        }
+        pwInput?.select();
+        return;
+      }
+
+      const switched = StorageService.switchUser(targetUser.id);
+      closeModal();
+      if (switched) {
+        this.currentUser = switched;
+        this.showToast(`Switched account to: ${switched.storeName || switched.name} (${switched.role})`, 'info');
+        this.navigate(switched.role === 'merchant' ? '#/sales' : '#/explore');
+      }
+    });
   }
 
   // =========================================================================
@@ -3957,11 +4688,18 @@ class MultiPageApp {
       isDragging = false;
     };
 
+    const handleMouseMove = (e: MouseEvent) => onPointerMove(e.clientX, e.clientY);
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        onPointerMove(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    };
+
     viewport?.addEventListener('mousedown', (e) => {
       e.preventDefault();
       onPointerDown(e.clientX, e.clientY);
     });
-    window.addEventListener('mousemove', (e) => onPointerMove(e.clientX, e.clientY));
+    window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', onPointerUp);
 
     viewport?.addEventListener('touchstart', (e) => {
@@ -3969,11 +4707,7 @@ class MultiPageApp {
         onPointerDown(e.touches[0].clientX, e.touches[0].clientY);
       }
     }, { passive: true });
-    window.addEventListener('touchmove', (e) => {
-      if (e.touches.length === 1) {
-        onPointerMove(e.touches[0].clientX, e.touches[0].clientY);
-      }
-    }, { passive: true });
+    window.addEventListener('touchmove', handleTouchMove, { passive: true });
     window.addEventListener('touchend', onPointerUp);
 
     // Brightness slider
@@ -4009,12 +4743,18 @@ class MultiPageApp {
     });
 
     // Close / Cancel
-    const closeModal = () => modal?.classList.remove('open');
+    const closeModal = () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', onPointerUp);
+      window.removeEventListener('touchmove', handleTouchMove);
+      window.removeEventListener('touchend', onPointerUp);
+      modal?.classList.remove('open');
+    };
     btnCancel?.addEventListener('click', closeModal);
     btnClose?.addEventListener('click', closeModal);
-    modal.addEventListener('click', (e) => {
+    modal.onclick = (e) => {
       if (e.target === modal) closeModal();
-    });
+    };
 
     // Canvas image sharpen filter helper
     const applyCanvasSharpen = (
@@ -4108,7 +4848,7 @@ class MultiPageApp {
           applyCanvasSharpen(ctx, targetW, targetH, sharpness / 100);
         }
 
-        const adjustedBase64 = canvas.toDataURL('image/jpeg', 0.90);
+        const adjustedBase64 = canvas.toDataURL('image/jpeg', 0.84);
         onApply(adjustedBase64);
         closeModal();
         this.showToast('Photo adjusted and applied successfully!', 'success');
@@ -4169,7 +4909,7 @@ class MultiPageApp {
             </div>
 
             <!-- Financial Metrics Summary (Revenue, Overheads, Net Profit, Debt) -->
-            <div class="statement-summary-boxes" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="statement-summary-boxes">
               <div class="statement-box">
                 <div class="statement-box-label">Total Sales Cash</div>
                 <div class="statement-box-val" style="color:#059669;">${formatCurrency(finSummary.totalRevenue, currency)}</div>
@@ -4195,38 +4935,40 @@ class MultiPageApp {
             </div>
 
             <!-- Itemized Sales Table -->
-            <table class="statement-table" style="margin-bottom:20px;">
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Customer</th>
-                  <th>Items Ordered</th>
-                  <th>Payment Method</th>
-                  <th>Status</th>
-                  <th style="text-align:right;">Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${sales
-                  .map(
-                    (s) => `
-                    <tr>
-                      <td style="white-space:nowrap; color:#64748b; font-size:11px;">${formatDate(s.createdAt)}</td>
-                      <td><strong>${s.customerName}</strong> ${s.customerPhone ? `<br/><span style="color:#94a3b8; font-size:10px;">${s.customerPhone}</span>` : ''}</td>
-                      <td style="font-size:11px;">${s.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</td>
-                      <td>${s.paymentMethod}</td>
-                      <td>
-                        <span style="font-weight:700; color:${s.status === 'completed' ? '#059669' : '#e11d48'};">
-                          ${s.status === 'completed' ? '✓ PAID' : '⏳ UNPAID DEBT'}
-                        </span>
-                      </td>
-                      <td style="text-align:right; font-family:monospace; font-weight:700;">${formatCurrency(s.totalAmount, currency)}</td>
-                    </tr>
-                  `
-                  )
-                  .join('')}
-              </tbody>
-            </table>
+            <div class="statement-table-scroll" style="margin-bottom:20px;">
+              <table class="statement-table" style="margin-bottom:0;">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Customer</th>
+                    <th>Items Ordered</th>
+                    <th>Payment Method</th>
+                    <th>Status</th>
+                    <th style="text-align:right;">Amount</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${sales
+                    .map(
+                      (s) => `
+                      <tr>
+                        <td style="white-space:nowrap; color:#64748b; font-size:11px;">${formatDate(s.createdAt)}</td>
+                        <td><strong>${s.customerName}</strong> ${s.customerPhone ? `<br/><span style="color:#94a3b8; font-size:10px;">${s.customerPhone}</span>` : ''}</td>
+                        <td style="font-size:11px;">${s.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</td>
+                        <td>${s.paymentMethod}</td>
+                        <td>
+                          <span style="font-weight:700; color:${s.status === 'completed' ? '#059669' : '#e11d48'};">
+                            ${s.status === 'completed' ? '✓ PAID' : '⏳ UNPAID DEBT'}
+                          </span>
+                        </td>
+                        <td style="text-align:right; font-family:monospace; font-weight:700;">${formatCurrency(s.totalAmount, currency)}</td>
+                      </tr>
+                    `
+                    )
+                    .join('')}
+                </tbody>
+              </table>
+            </div>
 
             ${
               expenses.length > 0
@@ -4234,35 +4976,37 @@ class MultiPageApp {
                 <div style="margin-bottom:12px; font-size:12px; font-weight:700; text-transform:uppercase; color:#475569;">
                   2. Shop Expenses & Bills (${expenses.length} records)
                 </div>
-                <table class="statement-table">
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Expense / Bill</th>
-                      <th>Category</th>
-                      <th>Vendor / Payee</th>
-                      <th>Payment Method</th>
-                      <th style="text-align:right;">Amount</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${expenses
-                      .slice(0, 10)
-                      .map(
-                        (e) => `
-                        <tr>
-                          <td style="white-space:nowrap; color:#64748b; font-size:11px;">${new Date(e.date || e.createdAt).toLocaleDateString()}</td>
-                          <td><strong>${e.title}</strong></td>
-                          <td>${e.category}</td>
-                          <td>${e.vendor || '—'}</td>
-                          <td>${e.paymentMethod || 'Cash'}</td>
-                          <td style="text-align:right; font-family:monospace; font-weight:700; color:#ea580c;">${formatCurrency(e.amount, currency)}</td>
-                        </tr>
-                      `
-                      )
-                      .join('')}
-                  </tbody>
-                </table>
+                <div class="statement-table-scroll" style="margin-bottom:20px;">
+                  <table class="statement-table" style="margin-bottom:0;">
+                    <thead>
+                      <tr>
+                        <th>Date</th>
+                        <th>Expense / Bill</th>
+                        <th>Category</th>
+                        <th>Vendor / Payee</th>
+                        <th>Payment Method</th>
+                        <th style="text-align:right;">Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${expenses
+                        .slice(0, 10)
+                        .map(
+                          (e) => `
+                          <tr>
+                            <td style="white-space:nowrap; color:#64748b; font-size:11px;">${new Date(e.date || e.createdAt).toLocaleDateString()}</td>
+                            <td><strong>${e.title}</strong></td>
+                            <td>${e.category}</td>
+                            <td>${e.vendor || '—'}</td>
+                            <td>${e.paymentMethod || 'Cash'}</td>
+                            <td style="text-align:right; font-family:monospace; font-weight:700; color:#ea580c;">${formatCurrency(e.amount, currency)}</td>
+                          </tr>
+                        `
+                        )
+                        .join('')}
+                    </tbody>
+                  </table>
+                </div>
               `
                 : ''
             }
@@ -4300,6 +5044,7 @@ class MultiPageApp {
   // PAGE: AUTH & ONBOARDING (INTRODUCTORY MESSAGE + LOGIN & SIGN UP FORMS)
   // =========================================================================
   private renderAuthPage(container: HTMLElement): void {
+    this.unmountMountedCharts();
     container.innerHTML = `
       <div class="auth-container">
         <!-- Return to active session if user clicked Switch -->
@@ -4365,10 +5110,28 @@ class MultiPageApp {
                     id="login-identifier"
                     class="form-input"
                     placeholder="e.g. 08023456789 or My Store"
+                    autocomplete="username"
                     required
                     autofocus
                   />
                 </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="login-password">Password</label>
+                  <div class="password-input-wrapper">
+                    <input
+                      type="password"
+                      id="login-password"
+                      class="form-input"
+                      placeholder="Enter your password"
+                      autocomplete="current-password"
+                      required
+                    />
+                    <button type="button" class="btn-toggle-password" data-target="login-password" aria-label="Toggle password visibility">Show</button>
+                  </div>
+                </div>
+
+                <div id="login-error-msg" class="auth-error-msg" role="alert"></div>
 
                 <button type="submit" class="btn btn-primary btn-lg" style="width:100%;">
                   Log In
@@ -4455,6 +5218,41 @@ class MultiPageApp {
                   </div>
                 </div>
 
+                <div class="form-grid-2col">
+                  <div class="form-group">
+                    <label class="form-label" for="auth-password">Password</label>
+                    <div class="password-input-wrapper">
+                      <input
+                        type="password"
+                        id="auth-password"
+                        class="form-input"
+                        placeholder="Min. 4 characters"
+                        minlength="4"
+                        autocomplete="new-password"
+                        required
+                      />
+                      <button type="button" class="btn-toggle-password" data-target="auth-password" aria-label="Toggle password visibility">Show</button>
+                    </div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="auth-confirm-password">Confirm Password</label>
+                    <div class="password-input-wrapper">
+                      <input
+                        type="password"
+                        id="auth-confirm-password"
+                        class="form-input"
+                        placeholder="Re-enter password"
+                        minlength="4"
+                        autocomplete="new-password"
+                        required
+                      />
+                      <button type="button" class="btn-toggle-password" data-target="auth-confirm-password" aria-label="Toggle password visibility">Show</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div id="signup-error-msg" class="auth-error-msg" role="alert"></div>
+
                 <button type="submit" class="btn btn-primary btn-lg" style="width:100%;">
                   Create Account
                 </button>
@@ -4472,6 +5270,8 @@ class MultiPageApp {
       </div>
     `;
 
+    this.bindPasswordToggles(container);
+
     // Tab Switcher Click Listeners
     document.getElementById('tab-auth-login')?.addEventListener('click', () => {
       this.authTab = 'login';
@@ -4484,19 +5284,61 @@ class MultiPageApp {
     });
 
     // Login Form Submit Event
-    document.getElementById('form-auth-login')?.addEventListener('submit', (e) => {
+    document.getElementById('form-auth-login')?.addEventListener('submit', async (e) => {
       e.preventDefault();
       const identifierInput = document.getElementById('login-identifier') as HTMLInputElement;
-      const identifier = identifierInput?.value.trim();
-      if (!identifier) return;
+      const passwordInput = document.getElementById('login-password') as HTMLInputElement;
+      const errorBox = document.getElementById('login-error-msg');
 
-      const user = StorageService.login(identifier);
-      if (user) {
-        this.currentUser = user;
-        this.showToast(`Welcome back, ${user.storeName || user.name}!`, 'success');
-        this.navigate(user.role === 'merchant' ? '#/sales' : '#/explore');
-      } else {
-        this.showToast(`No account found matching "${identifier}". Try Sign Up to create one.`, 'danger');
+      const showError = (msg: string) => {
+        if (errorBox) {
+          errorBox.textContent = msg;
+          errorBox.classList.add('visible');
+        }
+      };
+
+      if (errorBox) {
+        errorBox.textContent = '';
+        errorBox.classList.remove('visible');
+      }
+
+      const identifier = identifierInput?.value.trim();
+      const password = passwordInput?.value || '';
+      if (!identifier) {
+        showError('Please enter your phone number, store name, or email.');
+        return;
+      }
+      if (!password) {
+        showError('Please enter your password.');
+        return;
+      }
+
+      const submitBtn = (e.currentTarget as HTMLFormElement).querySelector('button[type="submit"]') as HTMLButtonElement | null;
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const result = await StorageService.verifyLogin(identifier, password);
+        if (result.status === 'success' && result.user) {
+          this.currentUser = result.user;
+          if (result.setFirstPassword) {
+            this.showToast(`Password set for your store! Welcome back, ${result.user.storeName || result.user.name}!`, 'success');
+          } else {
+            this.showToast(`Welcome back, ${result.user.storeName || result.user.name}!`, 'success');
+          }
+          this.navigate(result.user.role === 'merchant' ? '#/sales' : '#/explore');
+          return;
+        }
+
+        if (result.status === 'password_too_short') {
+          showError('Please enter a password of at least 4 characters to secure your account.');
+        } else if (result.status === 'wrong_password') {
+          showError('Incorrect password. Please try again.');
+          passwordInput?.select();
+        } else {
+          showError(`No account found matching "${identifier}". Try Sign Up to create one.`);
+        }
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
       }
     });
 
@@ -4530,36 +5372,75 @@ class MultiPageApp {
     });
 
     // Sign Up Form Submit Event
-    document.getElementById('form-auth-setup')?.addEventListener('submit', (e) => {
+    document.getElementById('form-auth-setup')?.addEventListener('submit', async (e) => {
       e.preventDefault();
       const role = (document.getElementById('auth-role') as HTMLInputElement)?.value as UserRole || 'merchant';
-      const name = (document.getElementById('auth-name') as HTMLInputElement)?.value || 'Merchant';
+      const name = (document.getElementById('auth-name') as HTMLInputElement)?.value.trim() || 'Merchant';
       const niche = (document.getElementById('auth-niche') as HTMLSelectElement)?.value || 'Fashion';
       const storeName = (document.getElementById('auth-store-name') as HTMLInputElement)?.value;
       const city = (document.getElementById('auth-city') as HTMLInputElement)?.value;
       const phone = (document.getElementById('auth-phone') as HTMLInputElement)?.value || '';
       const currency = (document.getElementById('auth-currency') as HTMLSelectElement)?.value || '₦';
+      const password = (document.getElementById('auth-password') as HTMLInputElement)?.value || '';
+      const confirmPassword = (document.getElementById('auth-confirm-password') as HTMLInputElement)?.value || '';
+      const errorBox = document.getElementById('signup-error-msg');
 
-      const newUser = StorageService.signup({
-        name,
-        email: `${name.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}@shopkepa.local`,
-        role,
-        niche: role === 'merchant' ? niche : undefined,
-        storeName: role === 'merchant' ? (storeName || `${name}'s Store`) : undefined,
-        city,
-        phone,
-        currency,
-      });
+      const showError = (msg: string) => {
+        if (errorBox) {
+          errorBox.textContent = msg;
+          errorBox.classList.add('visible');
+        }
+      };
 
-      this.currentUser = newUser;
-      this.showToast(
-        role === 'merchant'
-          ? `Welcome ${name}! Your store in ${niche} is ready and starts 100% empty.`
-          : `Welcome ${name}! Start exploring merchants in the marketplace.`,
-        'success'
-      );
+      if (errorBox) {
+        errorBox.textContent = '';
+        errorBox.classList.remove('visible');
+      }
 
-      this.navigate(role === 'merchant' ? '#/sales' : '#/explore');
+      if (password.length < 4) {
+        showError('Password must be at least 4 characters long.');
+        (document.getElementById('auth-password') as HTMLInputElement)?.focus();
+        return;
+      }
+
+      if (password !== confirmPassword) {
+        showError('Passwords do not match. Please re-enter.');
+        (document.getElementById('auth-confirm-password') as HTMLInputElement)?.focus();
+        return;
+      }
+
+      const submitBtn = (e.currentTarget as HTMLFormElement).querySelector('button[type="submit"]') as HTMLButtonElement | null;
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const salt = generatePasswordSalt();
+        const hash = await hashPassword(password, salt);
+
+        const newUser = StorageService.signup({
+          name,
+          email: `${name.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}@shopkepa.local`,
+          role,
+          niche: role === 'merchant' ? niche : undefined,
+          storeName: role === 'merchant' ? (storeName?.trim() || `${name}'s Store`) : undefined,
+          city,
+          phone,
+          currency,
+          passwordHash: hash,
+          passwordSalt: salt,
+        });
+
+        this.currentUser = newUser;
+        this.showToast(
+          role === 'merchant'
+            ? `Welcome ${name}! Your store in ${niche} is ready and starts 100% empty.`
+            : `Welcome ${name}! Start exploring merchants in the marketplace.`,
+          'success'
+        );
+
+        this.navigate(role === 'merchant' ? '#/sales' : '#/explore');
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
     });
   }
 
@@ -4680,11 +5561,32 @@ class MultiPageApp {
     });
 
     document.getElementById('btn-header-logout')?.addEventListener('click', () => {
-      StorageService.logout();
-      this.currentUser = null;
-      this.authTab = 'login';
-      this.showToast('You have logged out of your store.', 'info');
-      this.navigate('#/auth');
+      this.openConfirmActionModal({
+        title: 'Log Out of Store',
+        message: 'Are you sure you want to log out of your current account?',
+        detailHtml: `Active Account: <strong style="color:var(--text-primary);">${this.currentUser?.storeName || this.currentUser?.name || ''}</strong>`,
+        warning: 'Your saved inventory, sales, and customer records stay safe on this device.',
+        confirmLabel: 'Log Out',
+        danger: false,
+        onConfirm: () => {
+          StorageService.logout();
+          this.currentUser = null;
+          this.authTab = 'login';
+          this.showToast('You have logged out of your store.', 'info');
+          this.navigate('#/auth');
+        },
+      });
+    });
+
+    // Global banner reactivate button (available from any page when store is deactivated)
+    document.getElementById('btn-banner-reactivate')?.addEventListener('click', () => {
+      if (!this.currentUser) return;
+      const reactivated = StorageService.reactivateAccount(this.currentUser.id);
+      if (reactivated) {
+        this.currentUser = reactivated;
+        this.showToast('Store reactivated! Your storefront is now visible again in Explore.', 'success');
+        this.render();
+      }
     });
 
     // 0. Recharts Performance Dashboard Mounting
@@ -4705,18 +5607,11 @@ class MultiPageApp {
             products: StorageService.getProducts(this.currentUser.id),
             currency: currentCurrency,
             storeName,
+            lowStockThreshold: this.currentUser.lowStockThreshold ?? 5,
             onNavigate: (route: string) => this.navigate(route),
             onOpenDebtReminder: () => this.openWhatsAppDebtTemplateModal(),
             onQuickRestock: (productId: string) => {
-              const p = StorageService.getProduct(productId);
-              if (p) {
-                const updated = StorageService.saveProduct({
-                  ...p,
-                  stock: p.stock + 5,
-                });
-                this.showToast(`Added +5 units to ${updated.name}! (Now ${updated.stock} in stock)`, 'success');
-                this.render();
-              }
+              this.openAddStockModal(productId);
             },
           })
         );
@@ -4731,13 +5626,25 @@ class MultiPageApp {
 
     // 1. Explore Page Events
     if (path === '#/explore') {
+      const bindExploreReset = () => {
+        document.getElementById('btn-reset-explore-filters')?.addEventListener('click', () => {
+          this.exploreNicheFilter = 'All';
+          this.exploreSearchQuery = '';
+          const main = document.getElementById('page-viewport');
+          if (main) {
+            main.innerHTML = this.renderExplorePageHTML();
+            this.bindCurrentPageEvents(sales, products);
+          }
+        });
+      };
+
       const searchInput = document.getElementById('explore-search-input') as HTMLInputElement;
       searchInput?.addEventListener('input', (e) => {
         this.exploreSearchQuery = (e.target as HTMLInputElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main) {
-          main.innerHTML = this.renderExplorePageHTML();
-          this.bindCurrentPageEvents(sales, products);
+        const grid = document.getElementById('explore-merchant-grid');
+        if (grid) {
+          grid.innerHTML = this.renderExploreGridInnerHTML();
+          bindExploreReset();
         }
       });
 
@@ -4773,14 +5680,24 @@ class MultiPageApp {
         });
       });
 
-      document.getElementById('btn-reset-explore-filters')?.addEventListener('click', () => {
-        this.exploreNicheFilter = 'All';
-        this.exploreSearchQuery = '';
-        const main = document.getElementById('page-viewport');
-        if (main) {
-          main.innerHTML = this.renderExplorePageHTML();
-          this.bindCurrentPageEvents(sales, products);
-        }
+      bindExploreReset();
+
+      document.querySelectorAll('.btn-unwatch-product').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          const prodId = (e.currentTarget as HTMLElement).dataset.productId;
+          if (!prodId) return;
+          const prod = StorageService.getProduct(prodId);
+          if (prod) {
+            const watcherKey = this.currentUser?.id || 'guest';
+            StorageService.toggleWatchProduct(watcherKey, prod);
+            this.showToast(`Removed "${prod.name}" from stock tracking.`, 'info');
+            const main = document.getElementById('page-viewport');
+            if (main) {
+              main.innerHTML = this.renderExplorePageHTML();
+              this.bindCurrentPageEvents(sales, products);
+            }
+          }
+        });
       });
     }
 
@@ -4806,16 +5723,93 @@ class MultiPageApp {
         }
       });
 
+      const bindSalesTableRowActions = () => {
+        const tbody = document.getElementById('sales-table-body');
+        if (!tbody) return;
+
+        tbody.querySelectorAll('.btn-toggle-status').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const saleId = (e.currentTarget as HTMLElement).dataset.saleId;
+            const freshSalesList = this.currentUser ? StorageService.getSales(this.currentUser.id) : sales;
+            const targetSale = saleId ? freshSalesList.find((s) => s.id === saleId) : undefined;
+            if (!saleId || !targetSale) return;
+
+            const willMarkPaid = targetSale.status === 'pending';
+            this.openConfirmActionModal({
+              title: willMarkPaid ? 'Confirm Debt Payment' : 'Revert Sale to Unpaid Debt',
+              message: willMarkPaid
+                ? `Mark ${targetSale.customerName}'s balance as fully paid?`
+                : `Revert ${targetSale.customerName}'s completed sale back to unpaid debt?`,
+              detailHtml: `
+                <div><strong>Customer:</strong> ${targetSale.customerName}</div>
+                <div><strong>Items:</strong> ${targetSale.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</div>
+                <div><strong>Amount:</strong> <strong style="color:${willMarkPaid ? 'var(--accent-emerald)' : 'var(--accent-rose)'};">${formatCurrency(targetSale.totalAmount, currency)}</strong></div>
+              `,
+              warning: willMarkPaid
+                ? 'This will add the amount to your Money Collected total.'
+                : 'This will deduct the amount from Money Collected and move it to Money Customers Owe.',
+              confirmLabel: willMarkPaid ? '✓ Confirm Paid' : 'Revert to Debt',
+              danger: !willMarkPaid,
+              onConfirm: () => {
+                const updated = StorageService.toggleSaleStatus(saleId);
+                if (updated) {
+                  this.showToast(
+                    updated.status === 'completed'
+                      ? 'Marked as Paid! Total sales cash updated.'
+                      : 'Changed back to Unpaid Customer Debt.',
+                    updated.status === 'completed' ? 'success' : 'info'
+                  );
+                  this.render();
+                }
+              },
+            });
+          });
+        });
+
+        tbody.querySelectorAll('.btn-delete-sale').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const saleBtn = e.currentTarget as HTMLElement;
+            const saleId = saleBtn.dataset.saleId;
+            const freshSalesList = this.currentUser ? StorageService.getSales(this.currentUser.id) : sales;
+            const targetSale = saleId ? freshSalesList.find((s) => s.id === saleId) : undefined;
+            if (!saleId || !targetSale) return;
+
+            this.openConfirmActionModal({
+              title: 'Confirm Transaction Deletion',
+              message: 'Are you sure you want to permanently delete this sale/debt record?',
+              detailHtml: `
+                <div><strong>Customer:</strong> ${targetSale.customerName}</div>
+                <div><strong>Items:</strong> ${targetSale.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</div>
+                <div><strong>Amount:</strong> <strong style="color:var(--accent-rose);">${formatCurrency(targetSale.totalAmount, currency)}</strong> (${targetSale.status === 'completed' ? 'Paid' : 'Unpaid Debt'})</div>
+              `,
+              warning: '⚠️ This action cannot be undone and will immediately update your financial totals.',
+              confirmLabel: '🗑️ Delete Record',
+              danger: true,
+              onConfirm: () => {
+                StorageService.deleteSale(saleId);
+                this.showToast('Transaction record deleted.', 'info');
+                this.render();
+              },
+            });
+          });
+        });
+
+        tbody.querySelectorAll('.btn-send-debt-wa').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const saleId = (e.currentTarget as HTMLElement).dataset.saleId;
+            this.openWhatsAppDebtTemplateModal(saleId);
+          });
+        });
+      };
+
       const searchInput = document.getElementById('sales-search-input') as HTMLInputElement;
       searchInput?.addEventListener('input', (e) => {
         this.salesSearchQuery = (e.target as HTMLInputElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main && this.currentUser) {
-          main.innerHTML = this.renderSalesPageHTML(
-            StorageService.getSales(this.currentUser.id),
-            StorageService.calculateMetrics(StorageService.getSales(this.currentUser.id))
-          );
-          this.bindCurrentPageEvents(StorageService.getSales(this.currentUser.id), products);
+        const tbody = document.getElementById('sales-table-body');
+        if (tbody && this.currentUser) {
+          const freshSales = StorageService.getSales(this.currentUser.id);
+          tbody.innerHTML = this.renderSalesTableBodyHTML(freshSales);
+          bindSalesTableRowActions();
         }
       });
 
@@ -4854,44 +5848,13 @@ class MultiPageApp {
         this.showToast('Sales records downloaded as CSV!', 'success');
       });
 
-      document.querySelectorAll('.btn-toggle-status').forEach((btn) => {
+      bindSalesTableRowActions();
+
+      // Overdue alert banner WhatsApp buttons (outside #sales-table-body)
+      document.querySelectorAll('.alert-debtor-grid .btn-send-debt-wa').forEach((btn) => {
         btn.addEventListener('click', (e) => {
           const saleId = (e.currentTarget as HTMLElement).dataset.saleId;
-          if (saleId) {
-            const updated = StorageService.toggleSaleStatus(saleId);
-            if (updated) {
-              this.showToast(
-                updated.status === 'completed'
-                  ? 'Marked as Paid! Total sales cash updated.'
-                  : 'Changed back to Unpaid Customer Debt.',
-                updated.status === 'completed' ? 'success' : 'info'
-              );
-              this.render();
-            }
-          }
-        });
-      });
-
-      document.querySelectorAll('.btn-delete-sale').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const saleBtn = (e.currentTarget as HTMLElement);
-          const saleId = saleBtn.dataset.saleId;
-          if (!saleId) return;
-          if (saleBtn.dataset.confirming === 'true') {
-            StorageService.deleteSale(saleId);
-            this.showToast('Transaction record deleted.', 'info');
-            this.render();
-          } else {
-            saleBtn.dataset.confirming = 'true';
-            const originalText = saleBtn.textContent || '🗑️';
-            saleBtn.textContent = 'Confirm?';
-            saleBtn.style.color = 'var(--accent-rose)';
-            setTimeout(() => {
-              saleBtn.dataset.confirming = 'false';
-              saleBtn.textContent = originalText;
-              saleBtn.style.color = '';
-            }, 3500);
-          }
+          this.openWhatsAppDebtTemplateModal(saleId);
         });
       });
 
@@ -4903,13 +5866,6 @@ class MultiPageApp {
       document.querySelectorAll('.btn-open-wa-modal-general').forEach((btn) => {
         btn.addEventListener('click', () => {
           this.openWhatsAppDebtTemplateModal();
-        });
-      });
-
-      document.querySelectorAll('.btn-send-debt-wa').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const saleId = (e.currentTarget as HTMLElement).dataset.saleId;
-          this.openWhatsAppDebtTemplateModal(saleId);
         });
       });
     }
@@ -5041,54 +5997,6 @@ class MultiPageApp {
 
     // 4. Inventory Page Events
     if (path === '#/inventory') {
-      const searchInput = document.getElementById('inventory-search-input') as HTMLInputElement;
-      searchInput?.addEventListener('input', (e) => {
-        this.inventorySearchQuery = (e.target as HTMLInputElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main && this.currentUser) {
-          main.innerHTML = this.renderInventoryPageHTML(StorageService.getProducts(this.currentUser.id));
-          this.bindCurrentPageEvents(sales, StorageService.getProducts(this.currentUser.id));
-        }
-      });
-
-      const categorySelect = document.getElementById('inventory-category-select') as HTMLSelectElement;
-      categorySelect?.addEventListener('change', (e) => {
-        this.inventoryCategoryFilter = (e.target as HTMLSelectElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main && this.currentUser) {
-          main.innerHTML = this.renderInventoryPageHTML(StorageService.getProducts(this.currentUser.id));
-          this.bindCurrentPageEvents(sales, StorageService.getProducts(this.currentUser.id));
-        }
-      });
-
-      document.getElementById('btn-reset-inventory-filters')?.addEventListener('click', () => {
-        this.inventoryCategoryFilter = 'all';
-        this.inventorySearchQuery = '';
-        const main = document.getElementById('page-viewport');
-        if (main && this.currentUser) {
-          main.innerHTML = this.renderInventoryPageHTML(StorageService.getProducts(this.currentUser.id));
-          this.bindCurrentPageEvents(sales, StorageService.getProducts(this.currentUser.id));
-        }
-      });
-
-      // Quick restock +5 stock
-      document.querySelectorAll('.btn-quick-restock').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const prodId = (e.currentTarget as HTMLElement).dataset.productId;
-          if (prodId) {
-            const p = StorageService.getProduct(prodId);
-            if (p) {
-              const updated = StorageService.saveProduct({
-                ...p,
-                stock: p.stock + 5,
-              });
-              this.showToast(`Added +5 units to ${updated.name}! (Now ${updated.stock} in stock)`, 'success');
-              this.render();
-            }
-          }
-        });
-      });
-
       // In-App Product Delete Confirmation Modal Handlers (100% reliable in iFrames)
       let pendingDeleteProductId: string | null = null;
       const modalDeleteProduct = document.getElementById('modal-delete-product');
@@ -5137,16 +6045,66 @@ class MultiPageApp {
         this.render();
       });
 
-      document.querySelectorAll('.btn-delete-product').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const target = (e.currentTarget as HTMLElement).closest('.btn-delete-product') as HTMLElement || (e.currentTarget as HTMLElement);
-          const prodId = target.dataset.productId;
-          if (prodId) {
-            openDeleteProdModal(prodId);
+      const bindInventoryGridCardActions = () => {
+        const grid = document.getElementById('inventory-product-grid');
+        if (!grid) return;
+
+        grid.querySelectorAll('.btn-add-stock').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const prodId = (e.currentTarget as HTMLElement).dataset.productId;
+            if (prodId) {
+              this.openAddStockModal(prodId);
+            }
+          });
+        });
+
+        grid.querySelectorAll('.btn-delete-product').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const target = ((e.currentTarget as HTMLElement).closest('.btn-delete-product') as HTMLElement) || (e.currentTarget as HTMLElement);
+            const prodId = target.dataset.productId;
+            if (prodId) {
+              openDeleteProdModal(prodId);
+            }
+          });
+        });
+
+        grid.querySelector('#btn-reset-inventory-filters')?.addEventListener('click', () => {
+          this.inventoryCategoryFilter = 'all';
+          this.inventorySearchQuery = '';
+          const searchEl = document.getElementById('inventory-search-input') as HTMLInputElement | null;
+          const catEl = document.getElementById('inventory-category-select') as HTMLSelectElement | null;
+          if (searchEl) searchEl.value = '';
+          if (catEl) catEl.value = 'all';
+          if (this.currentUser) {
+            grid.innerHTML = this.renderInventoryGridInnerHTML(StorageService.getProducts(this.currentUser.id));
+            bindInventoryGridCardActions();
           }
         });
+      };
+
+      bindInventoryGridCardActions();
+
+      const searchInput = document.getElementById('inventory-search-input') as HTMLInputElement;
+      searchInput?.addEventListener('input', (e) => {
+        this.inventorySearchQuery = (e.target as HTMLInputElement).value;
+        const grid = document.getElementById('inventory-product-grid');
+        if (grid && this.currentUser) {
+          const freshProds = StorageService.getProducts(this.currentUser.id);
+          grid.innerHTML = this.renderInventoryGridInnerHTML(freshProds);
+          bindInventoryGridCardActions();
+        }
+      });
+
+      const categorySelect = document.getElementById('inventory-category-select') as HTMLSelectElement;
+      categorySelect?.addEventListener('change', (e) => {
+        this.inventoryCategoryFilter = (e.target as HTMLSelectElement).value;
+        const grid = document.getElementById('inventory-product-grid');
+        if (grid && this.currentUser) {
+          grid.innerHTML = this.renderInventoryGridInnerHTML(StorageService.getProducts(this.currentUser.id));
+          bindInventoryGridCardActions();
+        }
       });
     }
 
@@ -5325,33 +6283,73 @@ class MultiPageApp {
 
       document.getElementById('btn-delete-product-from-edit')?.addEventListener('click', (e) => {
         const prodId = (e.currentTarget as HTMLElement).dataset.productId;
-        if (prodId) {
-          const prod = StorageService.getProduct(prodId);
-          const name = prod ? prod.name : 'Product';
-          StorageService.deleteProduct(prodId);
-          this.inventoryCategoryFilter = 'all';
-          this.inventorySearchQuery = '';
-          this.showToast(`Product "${name}" deleted from inventory.`, 'info');
-          this.navigate('#/inventory');
-        }
+        if (!prodId) return;
+        const prod = StorageService.getProduct(prodId);
+        const name = prod ? prod.name : 'Product';
+        this.openConfirmActionModal({
+          title: 'Confirm Product Deletion',
+          message: `Are you sure you want to permanently delete "${name}" from your inventory?`,
+          detailHtml: prod
+            ? `
+              <div><strong>Product:</strong> ${prod.name}</div>
+              <div><strong>Category:</strong> ${prod.category}</div>
+              <div><strong>Price:</strong> <strong style="color:var(--accent-emerald);">${formatCurrency(prod.price, currency)}</strong></div>
+              <div><strong>Current Stock:</strong> ${prod.stock} units</div>
+            `
+            : undefined,
+          warning: '⚠️ This removes the product from your inventory and storefront catalog immediately.',
+          confirmLabel: '🗑️ Delete Product',
+          danger: true,
+          onConfirm: () => {
+            StorageService.deleteProduct(prodId);
+            this.inventoryCategoryFilter = 'all';
+            this.inventorySearchQuery = '';
+            this.showToast(`Product "${name}" deleted from inventory.`, 'info');
+            this.navigate('#/inventory');
+          },
+        });
       });
     }
 
     // 7. Storefront Page Events
     if (path === '#/storefront') {
-      document.querySelectorAll('.btn-copy-wa-link').forEach((btn) => {
+      document.querySelectorAll('.storefront-stock-filter-btn').forEach((btn) => {
         btn.addEventListener('click', (e) => {
-          const encoded = (e.currentTarget as HTMLElement).dataset.waLink;
-          if (encoded) {
-            const rawUrl = decodeURIComponent(encoded);
-            navigator.clipboard.writeText(rawUrl).then(() => {
-              this.showToast('WhatsApp order link copied!', 'success');
-            });
+          const filter = ((e.currentTarget as HTMLElement).dataset.stockFilter as 'all' | 'in_stock' | 'out_of_stock') || 'all';
+          this.storefrontStockFilter = filter;
+          const main = document.getElementById('page-viewport');
+          if (main) {
+            main.innerHTML = this.renderStorefrontPageHTML(products);
+            this.bindCurrentPageEvents(sales, products);
           }
         });
       });
 
-      document.getElementById('btn-copy-catalog-summary')?.addEventListener('click', () => {
+      document.querySelectorAll('.btn-toggle-watch-product').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          const prodId = (e.currentTarget as HTMLElement).dataset.productId;
+          if (!prodId) return;
+          const prod = StorageService.getProduct(prodId);
+          if (!prod) return;
+
+          const watcherKey = this.currentUser?.id || 'guest';
+          const isNowWatched = StorageService.toggleWatchProduct(watcherKey, prod);
+          this.showToast(
+            isNowWatched
+              ? `Now tracking stock for "${prod.name}". Check Explore anytime for live restock alerts!`
+              : `Stopped tracking stock for "${prod.name}".`,
+            isNowWatched ? 'success' : 'info'
+          );
+
+          const main = document.getElementById('page-viewport');
+          if (main) {
+            main.innerHTML = this.renderStorefrontPageHTML(products);
+            this.bindCurrentPageEvents(sales, products);
+          }
+        });
+      });
+
+      document.getElementById('btn-copy-catalog-summary')?.addEventListener('click', async () => {
         const urlParams = new URLSearchParams(window.location.hash.split('?')[1] || '');
         const targetId = urlParams.get('merchant') || this.currentUser?.id;
         const targetMerchant = targetId ? StorageService.getUserById(targetId) : this.currentUser;
@@ -5364,14 +6362,18 @@ class MultiPageApp {
           `WhatsApp: ${targetMerchant.phone}`,
           ``,
           ...targetProds.map(
-            (p) => `• ${p.name} - ${formatCurrency(p.price, currency)} (${p.stock > 0 ? 'In Stock' : 'Out of Stock'})`
+            (p) => `• ${p.name} - ${formatCurrency(p.price, targetMerchant.currency || currency)}`
           ),
           ``,
           `Tap to reply and order directly on WhatsApp!`,
         ];
-        navigator.clipboard.writeText(lines.join('\n')).then(() => {
-          this.showToast('Full catalog copied for WhatsApp status / broadcast!', 'success');
-        });
+        const copied = await copyTextToClipboard(lines.join('\n'));
+        this.showToast(
+          copied
+            ? 'Full catalog copied for WhatsApp status / broadcast!'
+            : 'Could not copy catalog automatically.',
+          copied ? 'success' : 'warning'
+        );
       });
     }
 
@@ -5397,13 +6399,47 @@ class MultiPageApp {
         }
       });
 
+      const bindExpenseTableRowActions = () => {
+        const tbody = document.getElementById('expenses-table-body');
+        if (!tbody) return;
+        tbody.querySelectorAll('.btn-delete-expense').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const expBtn = e.currentTarget as HTMLElement;
+            const expId = expBtn.dataset.expenseId;
+            if (!expId || !this.currentUser) return;
+            const exp = StorageService.getExpenses(this.currentUser.id).find((item) => item.id === expId);
+            this.openConfirmActionModal({
+              title: 'Confirm Expense Deletion',
+              message: 'Are you sure you want to delete this expense record?',
+              detailHtml: exp
+                ? `
+                  <div><strong>Expense:</strong> ${exp.title}</div>
+                  <div><strong>Category:</strong> ${exp.category}</div>
+                  <div><strong>Amount:</strong> <strong style="color:#fb923c;">${formatCurrency(exp.amount, currency)}</strong></div>
+                `
+                : undefined,
+              warning: '⚠️ This cannot be undone and will recalculate your take-home profit.',
+              confirmLabel: '🗑️ Delete Expense',
+              danger: true,
+              onConfirm: () => {
+                StorageService.deleteExpense(expId);
+                this.showToast('Expense record deleted.', 'info');
+                this.render();
+              },
+            });
+          });
+        });
+      };
+
+      bindExpenseTableRowActions();
+
       const searchInput = document.getElementById('expenses-search-input') as HTMLInputElement;
       searchInput?.addEventListener('input', (e) => {
         this.expensesSearchQuery = (e.target as HTMLInputElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main) {
-          main.innerHTML = this.renderExpensesPageHTML();
-          this.bindCurrentPageEvents(sales, products);
+        const tbody = document.getElementById('expenses-table-body');
+        if (tbody) {
+          tbody.innerHTML = this.renderExpensesTableBodyHTML();
+          bindExpenseTableRowActions();
         }
       });
 
@@ -5415,29 +6451,6 @@ class MultiPageApp {
           if (main) {
             main.innerHTML = this.renderExpensesPageHTML();
             this.bindCurrentPageEvents(sales, products);
-          }
-        });
-      });
-
-      document.querySelectorAll('.btn-delete-expense').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const expBtn = (e.currentTarget as HTMLElement);
-          const expId = expBtn.dataset.expenseId;
-          if (!expId) return;
-          if (expBtn.dataset.confirming === 'true') {
-            StorageService.deleteExpense(expId);
-            this.showToast('Expense record deleted.', 'info');
-            this.render();
-          } else {
-            expBtn.dataset.confirming = 'true';
-            const originalText = expBtn.textContent || '🗑️';
-            expBtn.textContent = 'Confirm?';
-            expBtn.style.color = 'var(--accent-rose)';
-            setTimeout(() => {
-              expBtn.dataset.confirming = 'false';
-              expBtn.textContent = originalText;
-              expBtn.style.color = '';
-            }, 3500);
           }
         });
       });
@@ -5668,13 +6681,82 @@ class MultiPageApp {
         }
       });
 
+      const bindBuyerTableRowActions = () => {
+        const tbody = document.getElementById('buyer-table-body');
+        if (!tbody) return;
+
+        tbody.querySelectorAll('.btn-toggle-buyer-status').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const pId = (e.currentTarget as HTMLElement).dataset.purchaseId;
+            if (!pId || !this.currentUser) return;
+            const purchase = StorageService.getBuyerPurchases(this.currentUser).find((item) => item.id === pId);
+            if (!purchase) return;
+            const willMarkPaid = purchase.status === 'pending';
+
+            this.openConfirmActionModal({
+              title: willMarkPaid ? 'Confirm Debt Settlement' : 'Revert to Outstanding Debt',
+              message: willMarkPaid
+                ? 'Mark this purchase debt as settled / paid?'
+                : 'Revert this settled purchase back to outstanding debt?',
+              detailHtml: `
+                <div><strong>Seller:</strong> ${purchase.merchantStoreName || 'Marketplace Merchant'}</div>
+                <div><strong>Items:</strong> ${purchase.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</div>
+                <div><strong>Amount:</strong> <strong>${formatCurrency(purchase.totalAmount, currency)}</strong></div>
+              `,
+              confirmLabel: willMarkPaid ? '✓ Mark Paid' : 'Revert to Debt',
+              danger: !willMarkPaid,
+              onConfirm: () => {
+                const updated = StorageService.toggleSaleStatus(pId);
+                if (updated) {
+                  this.showToast(
+                    updated.status === 'completed'
+                      ? 'Debt marked as Settled / Paid!'
+                      : 'Reverted to Outstanding Debt.',
+                    updated.status === 'completed' ? 'success' : 'info'
+                  );
+                  this.render();
+                }
+              },
+            });
+          });
+        });
+
+        tbody.querySelectorAll('.btn-delete-buyer-record').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const buyBtn = e.currentTarget as HTMLElement;
+            const pId = buyBtn.dataset.purchaseId;
+            if (!pId || !this.currentUser) return;
+            const purchase = StorageService.getBuyerPurchases(this.currentUser).find((item) => item.id === pId);
+            this.openConfirmActionModal({
+              title: 'Confirm Record Deletion',
+              message: 'Are you sure you want to delete this purchase/debt record?',
+              detailHtml: purchase
+                ? `
+                  <div><strong>Seller:</strong> ${purchase.merchantStoreName || 'Marketplace Merchant'}</div>
+                  <div><strong>Items:</strong> ${purchase.items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')}</div>
+                  <div><strong>Amount:</strong> <strong style="color:var(--accent-rose);">${formatCurrency(purchase.totalAmount, currency)}</strong></div>
+                `
+                : undefined,
+              warning: '⚠️ This record will be permanently removed from your purchase ledger.',
+              confirmLabel: '🗑️ Delete Record',
+              danger: true,
+              onConfirm: () => {
+                StorageService.deleteSale(pId);
+                this.showToast('Record removed.', 'info');
+                this.render();
+              },
+            });
+          });
+        });
+      };
+
       const searchInput = document.getElementById('buyer-search-input') as HTMLInputElement;
       searchInput?.addEventListener('input', (e) => {
         this.buyerSearchQuery = (e.target as HTMLInputElement).value;
-        const main = document.getElementById('page-viewport');
-        if (main) {
-          main.innerHTML = this.renderBuyerLedgerPageHTML();
-          this.bindCurrentPageEvents(sales, products);
+        const tbody = document.getElementById('buyer-table-body');
+        if (tbody) {
+          tbody.innerHTML = this.renderBuyerTableBodyHTML();
+          bindBuyerTableRowActions();
         }
       });
 
@@ -5773,46 +6855,7 @@ class MultiPageApp {
         this.render();
       });
 
-      document.querySelectorAll('.btn-toggle-buyer-status').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const pId = (e.currentTarget as HTMLElement).dataset.purchaseId;
-          if (pId) {
-            const updated = StorageService.toggleSaleStatus(pId);
-            if (updated) {
-              this.showToast(
-                updated.status === 'completed'
-                  ? 'Debt marked as Settled / Paid!'
-                  : 'Reverted to Outstanding Debt.',
-                updated.status === 'completed' ? 'success' : 'info'
-              );
-              this.render();
-            }
-          }
-        });
-      });
-
-      document.querySelectorAll('.btn-delete-buyer-record').forEach((btn) => {
-        btn.addEventListener('click', (e) => {
-          const buyBtn = (e.currentTarget as HTMLElement);
-          const pId = buyBtn.dataset.purchaseId;
-          if (!pId) return;
-          if (buyBtn.dataset.confirming === 'true') {
-            StorageService.deleteSale(pId);
-            this.showToast('Record removed.', 'info');
-            this.render();
-          } else {
-            buyBtn.dataset.confirming = 'true';
-            const originalText = buyBtn.textContent || '🗑️';
-            buyBtn.textContent = 'Confirm?';
-            buyBtn.style.color = 'var(--accent-rose)';
-            setTimeout(() => {
-              buyBtn.dataset.confirming = 'false';
-              buyBtn.textContent = originalText;
-              buyBtn.style.color = '';
-            }, 3500);
-          }
-        });
-      });
+      bindBuyerTableRowActions();
     }
 
     // 10. Settings Page Events
@@ -5827,9 +6870,17 @@ class MultiPageApp {
         }
       });
 
-      formSettings?.addEventListener('submit', (e) => {
+      this.bindPasswordToggles(formSettings || document);
+
+      formSettings?.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!this.currentUser) return;
+
+        const newPassword = (document.getElementById('settings-new-password') as HTMLInputElement)?.value || '';
+        if (newPassword && newPassword.length < 4) {
+          this.showToast('New password must be at least 4 characters long.', 'danger');
+          return;
+        }
 
         const name = (document.getElementById('settings-name') as HTMLInputElement).value;
         const role = roleSelect.value as UserRole;
@@ -5843,7 +6894,7 @@ class MultiPageApp {
         const lowStockThreshold = inputThreshold ? parseInt(inputThreshold.value, 10) || 5 : 5;
         const bankPaymentDetails = (document.getElementById('settings-bank-details') as HTMLTextAreaElement)?.value || '';
 
-        const updated = StorageService.updateUserProfile(this.currentUser.id, {
+        let updated = StorageService.updateUserProfile(this.currentUser.id, {
           name,
           role,
           storeName: role === 'merchant' ? (storeName || `${name}'s Store`) : undefined,
@@ -5856,9 +6907,17 @@ class MultiPageApp {
           bankPaymentDetails,
         });
 
+        if (updated && newPassword) {
+          const pwUpdated = await StorageService.updatePassword(this.currentUser.id, newPassword);
+          if (pwUpdated) updated = pwUpdated;
+        }
+
         if (updated) {
           this.currentUser = updated;
-          this.showToast('Profile, stock threshold & bank settings saved!', 'success');
+          this.showToast(
+            newPassword ? 'Profile & password settings saved!' : 'Profile, stock threshold & bank settings saved!',
+            'success'
+          );
           this.render();
         }
       });
@@ -5893,7 +6952,13 @@ class MultiPageApp {
       document.querySelectorAll('.btn-switch-user').forEach((btn) => {
         btn.addEventListener('click', (e) => {
           const uId = (e.currentTarget as HTMLElement).dataset.userId;
-          if (uId) {
+          if (!uId) return;
+          const targetUser = StorageService.getUserById(uId);
+          if (!targetUser) return;
+
+          if (targetUser.passwordHash) {
+            this.openSwitchAccountPasswordModal(targetUser);
+          } else {
             const switched = StorageService.switchUser(uId);
             if (switched) {
               this.currentUser = switched;
@@ -5920,12 +6985,23 @@ class MultiPageApp {
         if (!this.currentUser) return;
 
         if (!this.currentUser.isDeactivated) {
-          const deactivated = StorageService.deactivateAccount(this.currentUser.id);
-          if (deactivated) {
-            this.currentUser = deactivated;
-            this.showToast('Store temporarily deactivated and unlisted from Explore.', 'info');
-            this.render();
-          }
+          this.openConfirmActionModal({
+            title: 'Deactivate Storefront',
+            message: 'Are you sure you want to temporarily deactivate your storefront?',
+            detailHtml: `Store: <strong style="color:var(--text-primary);">${this.currentUser.storeName || this.currentUser.name}</strong>`,
+            warning: 'Your store will be hidden from Marketplace buyers until you reactivate it. Your inventory and sales records remain safe.',
+            confirmLabel: '⏸️ Deactivate Store',
+            danger: true,
+            onConfirm: () => {
+              if (!this.currentUser) return;
+              const deactivated = StorageService.deactivateAccount(this.currentUser.id);
+              if (deactivated) {
+                this.currentUser = deactivated;
+                this.showToast('Store temporarily deactivated and unlisted from Explore.', 'info');
+                this.render();
+              }
+            },
+          });
         } else {
           const reactivated = StorageService.reactivateAccount(this.currentUser.id);
           if (reactivated) {
@@ -5938,11 +7014,21 @@ class MultiPageApp {
 
       // Settings Log Out button
       document.getElementById('btn-settings-logout')?.addEventListener('click', () => {
-        StorageService.logout();
-        this.currentUser = null;
-        this.authTab = 'login';
-        this.showToast('You have logged out of your store.', 'info');
-        this.navigate('#/auth');
+        this.openConfirmActionModal({
+          title: 'Log Out of Store',
+          message: 'Are you sure you want to log out of this store?',
+          detailHtml: `Active Account: <strong style="color:var(--text-primary);">${this.currentUser?.storeName || this.currentUser?.name || ''}</strong>`,
+          warning: 'Your saved data stays safely stored in this browser.',
+          confirmLabel: 'Log Out',
+          danger: false,
+          onConfirm: () => {
+            StorageService.logout();
+            this.currentUser = null;
+            this.authTab = 'login';
+            this.showToast('You have logged out of your store.', 'info');
+            this.navigate('#/auth');
+          },
+        });
       });
 
       // Permanent Delete Account Modal Logic
@@ -6000,24 +7086,22 @@ class MultiPageApp {
         this.navigate('#/auth');
       });
 
-      document.getElementById('btn-wipe-data')?.addEventListener('click', (e) => {
-        const wipeBtn = (e.currentTarget as HTMLElement);
-        if (wipeBtn.dataset.confirming === 'true') {
-          if (this.currentUser) {
+      document.getElementById('btn-wipe-data')?.addEventListener('click', () => {
+        if (!this.currentUser) return;
+        this.openConfirmActionModal({
+          title: 'Clear All Store Sales & Products',
+          message: 'Are you sure you want to erase all products, sales, expenses, and customer debts for this store?',
+          detailHtml: `Store Profile Kept: <strong style="color:var(--text-primary);">${this.currentUser.storeName || this.currentUser.name}</strong>`,
+          warning: '⚠️ This permanently deletes all inventory items, sales transactions, expenses, and customer debt history.',
+          confirmLabel: '🗑️ Clear All Store Data',
+          danger: true,
+          onConfirm: () => {
+            if (!this.currentUser) return;
             StorageService.clearUserData(this.currentUser.id);
             this.showToast('All sales and inventory cleared. Store is completely empty!', 'info');
             this.navigate('#/sales');
-          }
-        } else {
-          wipeBtn.dataset.confirming = 'true';
-          wipeBtn.textContent = '⚠️ Click again to wipe store';
-          wipeBtn.style.color = 'var(--accent-rose)';
-          setTimeout(() => {
-            wipeBtn.dataset.confirming = 'false';
-            wipeBtn.textContent = 'Clear Sales & Products Only';
-            wipeBtn.style.color = '';
-          }, 4000);
-        }
+          },
+        });
       });
     }
   }
@@ -6025,14 +7109,17 @@ class MultiPageApp {
 
 // Mount application once
 let appInitialized = false;
-function initApp() {
+async function initApp() {
   if (appInitialized) return;
   appInitialized = true;
+  await StorageService.init();
   new MultiPageApp();
 }
 
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initApp);
+  document.addEventListener('DOMContentLoaded', () => {
+    void initApp();
+  });
 } else {
-  initApp();
+  void initApp();
 }

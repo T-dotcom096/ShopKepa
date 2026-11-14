@@ -25,6 +25,8 @@ export interface User {
   lowStockThreshold?: number; // User-defined stock threshold (default 5)
   enableStockNotifications?: boolean; // Browser push notifications for low stock
   bankPaymentDetails?: string; // Bank account details for automated WhatsApp payment invoices
+  passwordHash?: string;
+  passwordSalt?: string;
   isDeactivated?: boolean;
   deactivatedAt?: string;
   createdAt: string;

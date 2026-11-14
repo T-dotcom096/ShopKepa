@@ -1,6 +1,85 @@
 import { Expense, Sale } from './types.ts';
 
 /**
+ * Escape HTML special characters before interpolating user-entered text into markup or attributes.
+ */
+export function escapeHtml(str: string | number | undefined | null): string {
+  if (str === undefined || str === null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function generatePasswordSalt(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(12);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // Fallback below
+  }
+  return Date.now().toString(16) + Math.random().toString(16).slice(2, 10);
+}
+
+export async function hashPassword(password: string, salt: string): Promise<string> {
+  const input = `${salt}:${password}`;
+  try {
+    if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+      const encoded = new TextEncoder().encode(input);
+      const buffer = await crypto.subtle.digest('SHA-256', encoded);
+      return Array.from(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // Fallback below
+  }
+  // Deterministic fallback hash if SubtleCrypto is unavailable
+  let h1 = 0xdeadbeef ^ input.length;
+  let h2 = 0x41c6ce57 ^ input.length;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${(h2 >>> 0).toString(16).padStart(8, '0')}${(h1 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * Copy text to clipboard reliably with a fallback for sandboxed environments.
+ */
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Format a number into currency display with the merchant's symbol.
  */
 export function formatCurrency(amount: number, symbol: string = '₦'): string {
@@ -96,25 +175,18 @@ export function generateWhatsAppOrderLink(params: {
   productName: string;
   price: number;
   currency: string;
-  stock: number;
+  stock?: number;
 }): string {
   const cleanPhone = sanitizeWhatsAppPhone(params.phone);
-  const stockStatus =
-    params.stock === 0
-      ? 'Out of Stock (Pre-order Inquiry)'
-      : params.stock < 5
-      ? `Low Stock (${params.stock} left)`
-      : `In Stock (${params.stock} available)`;
 
   const message = [
-    `Hello ${params.storeName}! 🛍️`,
+    `Hello ${params.storeName}!`,
     `I would like to place an order from your ShopKepa storefront:`,
     ``,
-    `📦 Product: *${params.productName}*`,
-    `💰 Price: *${formatCurrency(params.price, params.currency)}*`,
-    `📊 Stock Status: *${stockStatus}*`,
+    `Product: *${params.productName}*`,
+    `Price: *${formatCurrency(params.price, params.currency)}*`,
     ``,
-    `Please confirm order availability and payment details. Thank you!`,
+    `Please share payment and delivery details. Thank you!`,
   ].join('\n');
 
   const encoded = encodeURIComponent(message);
@@ -128,8 +200,8 @@ export function generateWhatsAppOrderLink(params: {
  */
 export function fileToBase64(
   file: File,
-  maxDimension: number = 800,
-  quality: number = 0.85
+  maxDimension: number = 720,
+  quality: number = 0.80
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     // If not an image, fallback to raw FileReader
@@ -154,8 +226,8 @@ export function fileToBase64(
         try {
           let { width, height } = img;
 
-          // If image is already smaller than maxDimension and under 250KB, preserve it
-          if (width <= maxDimension && height <= maxDimension && file.size < 250000) {
+          // If image is already compact (< 120KB) and within maxDimension, preserve it
+          if (width <= maxDimension && height <= maxDimension && file.size < 120000) {
             resolve(rawDataUrl);
             return;
           }
@@ -188,12 +260,26 @@ export function fileToBase64(
           ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(img, 0, 0, width, height);
 
-          // Compress to JPEG (or PNG if original was transparent PNG)
-          const outputType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+          // Keep PNG only if the image actually contains transparent pixels; otherwise encode as compact JPEG
+          let usePng = false;
+          if (file.type === 'image/png') {
+            try {
+              const pixels = ctx.getImageData(0, 0, width, height).data;
+              for (let i = 3; i < pixels.length; i += 16) {
+                if (pixels[i] < 250) {
+                  usePng = true;
+                  break;
+                }
+              }
+            } catch {
+              usePng = false;
+            }
+          }
+
+          const outputType = usePng ? 'image/png' : 'image/jpeg';
           const compressedDataUrl = canvas.toDataURL(outputType, quality);
           resolve(compressedDataUrl);
         } catch {
-          // If canvas operations fail, return original raw DataURL
           resolve(rawDataUrl);
         }
       };
